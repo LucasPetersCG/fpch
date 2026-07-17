@@ -1,0 +1,27 @@
+# Python / uv
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+*.egg-info/
+dist/
+build/
+
+# Área de trabalho do FPCH — prompts encenados e temporários de execução.
+# Efêmero por natureza; nada aqui deve virar histórico.
+.fpch-work/
+
+# Clones de alvos de canibalização. NUNCA versionar: é código de terceiro, com
+# licença de terceiro, e o repo do FPCH não pode carregar isso.
+clones/
+docker/out/
+
+# Build do TCC
+*.docx
+~$*
+
+# Editor / SO
+.vscode/
+.idea/
+Thumbs.db
+desktop.ini
