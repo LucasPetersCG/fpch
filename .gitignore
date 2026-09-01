@@ -17,7 +17,9 @@ clones/
 docker/out/
 
 # Build do TCC
-*.docx
+# Decisão do autor (01/09/2026): os entregáveis gerados SÃO versionados — o .docx
+# é o formato que a USP/Esalq recebe, e o .pptx é o artefato da defesa. Só os
+# arquivos de trava do Word ficam de fora.
 ~$*
 
 # Editor / SO
@@ -25,3 +27,7 @@ docker/out/
 .idea/
 Thumbs.db
 desktop.ini
+
+# Saída de ferramenta de análise — regenerável, não é história do projeto.
+graphify-out/
+.workstrator_tasks.json
