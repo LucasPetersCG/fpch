@@ -1,0 +1,190 @@
+# fpch.policy.toml — arquivo de política de referência do FPCH
+#
+# Lido por `src/fpch/policy.py` (função `load()`). Este arquivo fica no
+# diretório de trabalho do repositório, então ocupa o 3º nível da cascata de
+# precedência (perde para `--policy` e para `FPCH_POLICY`; vence
+# `~/.fpch/policy.toml` e o default embutido no código).
+#
+# Precedência completa, da maior para a menor:
+#   1. --policy <caminho>            (linha de comando)
+#   2. variável de ambiente FPCH_POLICY
+#   3. ./fpch.policy.toml            (este arquivo)
+#   4. ~/.fpch/policy.toml
+#   5. default embutido em src/fpch/policy.py
+#
+# Os valores abaixo REPRODUZEM o default embutido — carregar este arquivo não
+# muda nenhum comportamento hoje. Ele existe para servir de modelo: quem
+# quiser divergir edita um bloco aqui e o resto continua herdando o default.
+# Um bloco pode ser omitido inteiramente — o loader usa o default embutido
+# para qualquer bloco ausente e registra a origem em `fpch config --dump`.
+#
+# Arquivo malformado, com chave desconhecida, ou com valor de tipo errado FALHA
+# ALTO E CEDO — nunca degrada em silêncio. Ver o docstring de `policy.py`.
+
+[meta]
+versao = 1
+
+[escalada]
+# Quantos backends a mais tentar depois do preferido, antes de desistir.
+max_escalations = 2
+# Critério de ordenação dentro de uma classe de tarefa: mais barato primeiro;
+# empate de custo desfeito por potência decrescente (o "-" inverte o sentido).
+ordenar_por = ["cost", "-power"]
+
+[backends]
+# Segundos antes de abortar a chamada ao backend.
+timeout_s = 600
+# Acima disto (em caracteres) o prompt vai para arquivo em vez de argumento de
+# linha de comando — o Windows corta CreateProcess em 32767 chars; ver
+# `backends.py::_stage_prompt`.
+arg_limit = 24000
+
+[falha]
+# Resposta mais curta que isto (em caracteres) é tratada como recusa ou
+# saudação, não como trabalho de fato feito.
+min_chars = 40
+# Frases que os CLIs de terceiro emitem MESMO COM exit code 0. `exit == 0` não
+# é contrato de sucesso nestes CLIs — ver o comentário longo em backends.py.
+assinaturas = [
+    "no output produced",
+    "auto-denied",
+    "headless mode cannot prompt",
+    "permission that headless",
+    "ineligibletiererror",
+    "client no longer supported",
+    "quota exceeded",
+    "rate limit exceeded",
+]
+
+# --- catálogo de modelos --------------------------------------------------
+# Ordem importa dentro de um pool: entre dois modelos de mesmo custo, o
+# primeiro do arquivo é o preferido em caso de empate na ordenação.
+
+[[modelos]]
+id = "Gemini 3.5 Flash (Low)"
+backend = "agy"
+pool = "agy:google"
+power = 2
+cost = 1
+good_for = ["mechanical"]
+notes = "Piso do arsenal. Só é escolhido se Medium falhar — custa o mesmo e é mais fraco."
+
+[[modelos]]
+id = "Gemini 3.5 Flash (Medium)"
+backend = "agy"
+pool = "agy:google"
+power = 3
+cost = 1
+good_for = ["mechanical", "standard"]
+
+[[modelos]]
+id = "Gemini 3.5 Flash (High)"
+backend = "agy"
+pool = "agy:google"
+power = 3
+cost = 2
+good_for = ["mechanical", "standard"]
+notes = "Cavalo de batalha indicado pelo autor: rápido e bom até tarefa mediana."
+
+[[modelos]]
+id = "Gemini 3.1 Pro (Low)"
+backend = "agy"
+pool = "agy:google"
+power = 4
+cost = 2
+good_for = ["standard"]
+
+[[modelos]]
+id = "Gemini 3.1 Pro (High)"
+backend = "agy"
+pool = "agy:google"
+power = 4
+cost = 3
+good_for = ["standard", "hard"]
+notes = "Teto da cota Google. Tentar aqui ANTES de gastar cota Anthropic."
+
+[[modelos]]
+id = "GPT-OSS 120B (Medium)"
+backend = "agy"
+pool = "agy:google"
+power = 3
+cost = 1
+good_for = ["mechanical", "standard"]
+notes = "Diversidade de família — útil para segunda opinião independente."
+
+[[modelos]]
+id = "Claude Sonnet 4.6 (Thinking)"
+backend = "agy"
+pool = "agy:anthropic"
+power = 4
+cost = 3
+good_for = ["standard", "hard"]
+
+[[modelos]]
+id = "Claude Opus 4.6 (Thinking)"
+backend = "agy"
+pool = "agy:anthropic"
+power = 5
+cost = 5
+good_for = ["hard"]
+notes = "Caro (autor). Só quando Gemini 3.1 Pro (High) não dá conta."
+
+[[modelos]]
+id = "default"
+backend = "copilot"
+pool = "copilot"
+power = 4
+cost = 3
+good_for = ["standard", "hard"]
+notes = "Backend mais maduro: reporta AI credits, tem --max-ai-credits e allowlist."
+
+# --- hooks determinísticos -------------------------------------------------
+# Um hook é um comando que roda na máquina de quem usa o FPCH. Por isso o
+# DEFAULT EMBUTIDO do código não declara nenhum: uma política padrão que já
+# viesse com comandos prontos transformaria a mera instalação da ferramenta em
+# execução de código não pedida. Declarar hook é ato explícito do operador, no
+# arquivo dele — que é exatamente o que este arquivo é.
+#
+# O hook abaixo é a Camada 4 (Determinística) do TCC em sua menor forma útil:
+# um sensor que não pede juízo a nenhum modelo. O veredito dele vai para a
+# trilha como evento `verify`, com `component`, `verdict` e `evidence`, e é daí
+# que sai o dado auditável que o texto precisa citar.
+
+[[hooks]]
+nome = "pytest"
+cmd = ["uv", "run", "--with", "pytest", "pytest", "-q"]
+quando = "sempre"
+criterio = "exit_zero"
+
+[causa_raiz]
+categorias = ["epistemica", "competencia", "ambiente"]
+# Lista provisória — ver o comentário em `policy.py::CausaRaizBlock`.
+subtipos = [
+    "timeout",
+    "quota_excedida",
+    "resposta_vazia",
+    "assinatura_de_falha",
+    "erro_de_ambiente",
+    "outro",
+]
+
+# ---------------------------------------------------------------------------
+# O QUE NÃO ESTÁ AQUI, E POR QUÊ
+#
+# Quatro blocos são deliberadamente NÃO-externalizáveis — não existe uma
+# tabela TOML para eles, em nenhum nível da cascata, porque cada um É a
+# própria defesa contra o conteúdo hostil que a canibalização assume como
+# premissa (cannibalize.py:17-27). Um arquivo gravável entregaria essa defesa
+# a um agente que corre com permissão de escrita — o anti-padrão que o TCC
+# condena ao citar Rashidi.
+#
+#   1. Regras de proveniência       — cannibalize.py:173-205
+#   2. Cláusula anti-injeção        — cannibalize.py:208-247
+#   3. Padrões de contenção         — backends.py:128-129
+#   4. Portão de aprovação humana   — cli.py:213-219 (cannibalize.run() ainda
+#                                      não confere target.status; ver Onda 2C)
+#
+# Ver `IMMUTABLE_BLOCKS` em `src/fpch/policy.py` para a razão de cada um por
+# extenso, e `fpch config --dump` (Onda 2A) para vê-los listados como
+# imutáveis ao lado da política que de fato é configurável.
+# ---------------------------------------------------------------------------

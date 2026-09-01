@@ -1,13 +1,36 @@
 """CLI do FPCH.
 
-    fpch models                      catálogo + o que está instalado
-    fpch plan hard                   mostra a cadeia de escalada, sem gastar cota
-    fpch ask standard "prompt"       roteia e imprime
+    fpch [--policy P] models         catálogo + o que está instalado
+    fpch [--policy P] plan hard      mostra a cadeia de escalada, sem gastar cota
+    fpch [--policy P] ask standard "prompt"   roteia e imprime
+    fpch config --dump               política efetiva, bloco a bloco, com a origem
+    fpch check                       roda os hooks determinísticos da política
     fpch audit                       para onde a cota foi
+    fpch improve                     lê a trilha e PROPÕE mudança de política (não aplica)
+    fpch --policy P improve --apply <id>   autoriza uma proposta, no arquivo que você nomeou
+    fpch quote-check <ficha> <fonte> trechos entre aspas existem na fonte?
     fpch canib add <url> [--note]    enfileira alvo
     fpch canib list                  fila
     fpch canib accept <id>           aprovação humana (obrigatória)
     fpch canib run <id>              extrai + propõe → ficha em docs/
+
+**A política é carregada uma vez, em `main()`, antes de qualquer subcomando.**
+`--policy` é global e vem ANTES do subcomando (`fpch --policy p.toml plan hard`),
+porque a política não é opção de um comando: é o contexto em que todos rodam.
+A cascata inteira (linha de comando → `FPCH_POLICY` → `./fpch.policy.toml` →
+`~/.fpch/policy.toml` → default embutido) é resolvida por `policy.load()`; aqui
+só se passa adiante o caminho pedido na linha de comando.
+
+Política malformada **derruba o processo antes de qualquer trabalho**, com código
+de saída 2 e a mensagem em `stderr`. Códigos de saída, por convenção deste CLI:
+
+    0  o comando fez o que prometeu
+    1  o comando rodou e o resultado reprovou (hook falhou, citação fabricada…)
+    2  o comando não chegou a rodar (política ilegível, uso errado)
+
+Separar 1 de 2 importa: um `fpch check` que devolve 1 disse algo sobre o projeto;
+um que devolve 2 não chegou a olhar para ele. Confundir os dois faria uma política
+quebrada parecer uma verificação reprovada — e o inverso, pior ainda.
 """
 
 from __future__ import annotations
@@ -17,17 +40,21 @@ import json
 import sys
 from pathlib import Path
 
-from . import audit, backends, cannibalize, citations, router
-from .models import CATALOG, TaskClass
+from . import audit, backends, cannibalize, citations, hooks, improve, models, policy, quotes, router
+from .models import TaskClass
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_WORKDIR = REPO_ROOT / ".fpch-work"
 DEFAULT_FICHE_DIR = REPO_ROOT / "docs" / "referencias" / "fichamentos"
 
+#: Código de saída para "não chegou a rodar" — ver o docstring do módulo.
+EXIT_USO = 2
 
-def _cmd_models(_: argparse.Namespace) -> int:
+
+def _cmd_models(args: argparse.Namespace) -> int:
+    print(f"(política: {args.policy_obj.fonte})")
     by_pool: dict[str, list] = {}
-    for m in CATALOG:
+    for m in args.catalog:
         by_pool.setdefault(m.pool.value, []).append(m)
     for pool, models in by_pool.items():
         installed = backends.available(models[0].backend)
@@ -43,11 +70,18 @@ def _cmd_models(_: argparse.Namespace) -> int:
 
 
 def _cmd_plan(args: argparse.Namespace) -> int:
+    # `router.plan` lê o catálogo em vigor via `models.candidates()`, e `main()`
+    # já colocou em vigor o catálogo derivado da política. `max_escalations` vem
+    # do bloco [escalada] — é o que faz `--policy` mudar o tamanho da cadeia.
     try:
-        chain = router.plan(TaskClass(args.task_class))
+        chain = router.plan(
+            TaskClass(args.task_class),
+            max_escalations=args.policy_obj.escalada.max_escalations,
+        )
     except router.NoBackendAvailable as exc:
         print(f"erro: {exc}", file=sys.stderr)
         return 1
+    print(f"(política: {args.policy_obj.fonte})")
     print(f"cadeia para '{args.task_class}':")
     for i, m in enumerate(chain):
         tag = "preferido" if i == 0 else f"fallback {i}"
@@ -63,13 +97,17 @@ def _cmd_ask(args: argparse.Namespace) -> int:
         prompt = Path(args.file).read_text(encoding="utf-8")
 
     DEFAULT_WORKDIR.mkdir(parents=True, exist_ok=True)
+    # `--timeout` ausente herda [backends].timeout_s da política; passado na
+    # linha de comando, vence — quem digita o número está pedindo aquele número.
+    timeout_s = args.timeout if args.timeout is not None else args.policy_obj.backends.timeout_s
     try:
         result = router.route(
             TaskClass(args.task_class),
             prompt,
             workdir=DEFAULT_WORKDIR,
             model_id=args.model,
-            timeout_s=args.timeout,
+            max_escalations=args.policy_obj.escalada.max_escalations,
+            timeout_s=timeout_s,
             allow_write=args.allow_write,
             label=args.label,
         )
@@ -112,8 +150,135 @@ def _cmd_cite_check(args: argparse.Namespace) -> int:
     return 1 if report.fabricated else 0
 
 
-def _cmd_audit(_: argparse.Namespace) -> int:
-    s = audit.summary()
+def _cmd_quote_check(args: argparse.Namespace) -> int:
+    fiche, source = Path(args.fiche), Path(args.source)
+    for p in (fiche, source):
+        if not p.exists():
+            print(f"não existe: {p}", file=sys.stderr)
+            return 1
+    report = quotes.validate_files(fiche, source)
+    print(report.summary())
+    for q in report.absent:
+        print(f"  AUSENTE      {q.text[:80]}…")
+    for q in report.approximate:
+        print(f"  aproximado   {q.detail}  |  {q.text[:60]}…")
+    for p in report.bad_pages:
+        print(f"  PÁGINA       p. {p.page} — {p.detail}")
+    if args.emit_block:
+        print()
+        print(quotes.render_block(report, source.name))
+    # Só trecho ausente e página inexistente reprovam. "Aproximado" costuma ser
+    # ruído da extração do PDF — reprovar por isso seria acusar o inocente, que é
+    # exatamente o erro documentado em citations.py.
+    return 1 if report.failed else 0
+
+
+def _cmd_config(args: argparse.Namespace) -> int:
+    """`fpch config --dump` — seção 5.4 da fatia funcional.
+
+    Só imprime o que `policy.dump()` produz: valor e origem por bloco, mais os
+    blocos imutáveis com a razão de cada um. Reimplementar a formatação aqui
+    abriria a chance de a CLI mostrar uma política diferente da que de fato está
+    valendo, que é o oposto do propósito do comando.
+    """
+    if not args.dump:
+        print("uso: fpch [--policy CAMINHO] config --dump", file=sys.stderr)
+        return EXIT_USO
+    print(policy.dump(args.policy_obj))
+    return 0
+
+
+def _cmd_check(args: argparse.Namespace) -> int:
+    """`fpch check` — seção 6 da fatia funcional.
+
+    **Decisão registrada (item 6 da Onda 2A): política sem nenhum hook aplicável
+    devolve código de saída DIFERENTE de zero**, com a razão explícita na tela.
+
+    A alternativa considerada era sair com 0 imprimindo "nenhum hook declarado".
+    Foi recusada: `fpch check` só existe para afirmar algo sobre o projeto, e
+    saída zero é lida — por humano e por CI — como "verificado e aprovado". Um
+    projeto sem verificador nenhum não foi aprovado; ele não foi verificado, e o
+    nome disso é `absent`. `hooks.overall()` já decide exatamente assim para o
+    conjunto vazio, e `hooks.py` é explícito em que a CLI não deve reinterpretar
+    o veredito — daí `return report.exit_code` sem nenhuma tradução no caminho.
+    É a seção 3 do contrato aplicada ao próprio verificador: promessa que falha
+    jamais é lida como promessa cumprida, e promessa que nunca foi feita também
+    não.
+
+    Quem quiser um `check` que não reprove por ausência declara um hook na
+    política — que é precisamente o comportamento que se quer induzir.
+    """
+    quando = None if args.todos else args.quando
+    report = hooks.check(
+        args.policy_obj,
+        quando=quando,
+        cwd=args.cwd,
+        timeout_s=args.timeout,
+        label=args.label,
+    )
+    print(hooks.format_report(report))
+    if not report.results:
+        print(
+            "nenhum hook declarado na política em vigor "
+            f"({args.policy_obj.fonte}) para quando="
+            f"{'qualquer momento' if quando is None else repr(quando)}.\n"
+            "Nada foi verificado — isto NÃO é aprovação. Declare um bloco [[hooks]] "
+            "com nome/cmd/quando/criterio para que `fpch check` possa afirmar algo.",
+            file=sys.stderr,
+        )
+    return report.exit_code
+
+
+def _cmd_improve(args: argparse.Namespace) -> int:
+    """`fpch improve` — seção 8 da fatia funcional, o laço com portão.
+
+    Dois modos, e a separação entre eles é o ponto do comando: **sem `--apply`**,
+    lê a trilha e no máximo grava uma proposta em disco, sem tocar em política
+    nenhuma; **com `--apply ID`**, edita o arquivo de política que o humano nomeou
+    em `--policy`.
+
+    `--apply` sem `--policy` é erro de uso (código 2), não um default conveniente.
+    A cascata de `policy.load()` decide qual política *vale*; deixá-la decidir qual
+    arquivo é *editado* faria o laço escrever num arquivo que ninguém apontou — e o
+    portão de aprovação humana perderia a metade que importa, que é o humano saber
+    exatamente o que assinou.
+    """
+    trilha = Path(args.trilha) if args.trilha else None
+    propostas = Path(args.propostas) if args.propostas else None
+
+    if args.apply:
+        if not args.policy:
+            print(
+                "erro de uso: `improve --apply` escreve na política e por isso exige que você "
+                "nomeie o arquivo:\n"
+                f"    fpch --policy <arquivo.toml> improve --apply {args.apply}\n"
+                "A cascata decide qual política vale, não qual arquivo é editado.",
+                file=sys.stderr,
+            )
+            return EXIT_USO
+        resultado = improve.aplicar(
+            args.apply,
+            policy_path=Path(args.policy),
+            trilha=trilha,
+            propostas_dir=propostas,
+        )
+        saida = sys.stdout if resultado.ok else sys.stderr
+        print(improve.format_resultado(resultado), file=saida)
+        return resultado.exit_code
+
+    analise = improve.propor(args.policy_obj, trilha=trilha, propostas_dir=propostas,
+                             label=args.label)
+    print(improve.format_analise(analise))
+    return analise.exit_code
+
+
+def _cmd_audit(args: argparse.Namespace) -> int:
+    trilha = Path(args.trilha) if getattr(args, "trilha", None) else None
+
+    if getattr(args, "verify", False):
+        return _cmd_audit_verify(trilha)
+
+    s = audit.summary(trilha)
     if not s["total_calls"]:
         print("sem registros ainda.")
         return 0
@@ -121,6 +286,48 @@ def _cmd_audit(_: argparse.Namespace) -> int:
     print(f"{'pool':<18}{'chamadas':>10}{'falhas':>8}{'lat.méd':>10}{'chars':>10}")
     for pool, agg in sorted(s["by_pool"].items()):
         print(f"{pool:<18}{agg['calls']:>10}{agg['fail']:>8}{agg['latency_avg']:>9}s{agg['chars_out']:>10}")
+    return 0
+
+
+def _cmd_audit_verify(trilha: Path | None) -> int:
+    """`fpch audit --verify` — §4.2 da fatia funcional.
+
+    Chama `audit.verify_chain()` (não reimplementa a verificação aqui) e traduz
+    o par `(íntegra, índice)` num veredito legível. Duas armadilhas evitadas:
+
+    1. `verify_chain` devolve `(True, None)` tanto para "cadeia íntegra e
+       conferida" quanto para "trilha vazia ou inexistente" — são a mesma coisa
+       para quem só quer saber se algo está quebrado, mas são vereditos
+       DIFERENTES para quem pergunta "isto prova integridade?". Ausência de
+       dado não é integridade confirmada (seção 3 do contrato: promessa que
+       falha jamais é lida como promessa cumprida — e aqui a promessa nem chegou
+       a ser testada). Por isso a contagem de linhas via `audit.read_all()`
+       decide qual dos dois vereditos é impresso.
+    2. O índice do primeiro defeito é a posição física (linha não vazia, a
+       partir de zero) — documentado no docstring de `verify_chain` — e é
+       repetido aqui explicitamente para que quem lê a tela não precise abrir
+       `audit.py` para saber o que o número significa.
+    """
+    ok, indice = audit.verify_chain(trilha)
+
+    if not ok:
+        print(
+            f"trilha QUEBRADA — primeiro defeito no índice {indice} "
+            "(conta linhas não vazias, na ordem física do arquivo, a partir de zero).",
+            file=sys.stderr,
+        )
+        return 1
+
+    conferidas = len(audit.read_all(trilha))
+    if conferidas == 0:
+        print(
+            "trilha vazia ou inexistente — nada foi conferido. "
+            "Isto NÃO é integridade confirmada, é ausência de dado.",
+            file=sys.stderr,
+        )
+        return 1
+
+    print(f"trilha íntegra — {conferidas} linha(s) conferida(s).")
     return 0
 
 
@@ -215,6 +422,15 @@ def _cmd_canib(args: argparse.Namespace) -> int:
 
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="fpch", description="FPCH — roteador multi-modelo e canibalizador")
+    # Global e ANTES do subcomando: a política é o contexto de todos eles, não
+    # opção de um. `policy.load()` resolve a cascata completa; daqui só sobe o
+    # nível 1 (linha de comando).
+    p.add_argument(
+        "--policy",
+        metavar="CAMINHO",
+        help="arquivo de política TOML (nível 1 da cascata; vence FPCH_POLICY, "
+             "./fpch.policy.toml, ~/.fpch/policy.toml e o default embutido)",
+    )
     sub = p.add_subparsers(dest="cmd", required=True)
 
     sub.add_parser("models", help="lista o catálogo por pool de cota").set_defaults(fn=_cmd_models)
@@ -228,18 +444,57 @@ def build_parser() -> argparse.ArgumentParser:
     sa.add_argument("prompt", nargs="?", default="-", help="prompt, ou '-' para stdin")
     sa.add_argument("--file", help="lê o prompt deste arquivo")
     sa.add_argument("--model", help="força um modelo e desliga a escalada")
-    sa.add_argument("--timeout", type=int, default=backends.DEFAULT_TIMEOUT_S)
+    sa.add_argument("--timeout", type=int, default=None,
+                    help=f"segundos (default: [backends].timeout_s da política, "
+                         f"hoje {backends.DEFAULT_TIMEOUT_S} no embutido)")
     sa.add_argument("--allow-write", action="store_true", help="⚠️ permite que o agente escreva")
     sa.add_argument("--label", help="rótulo para o audit log")
     sa.add_argument("--json", action="store_true")
     sa.set_defaults(fn=_cmd_ask)
 
-    sub.add_parser("audit", help="resumo de uso por pool").set_defaults(fn=_cmd_audit)
+    cf = sub.add_parser("config", help="mostra a política efetiva")
+    cf.add_argument("--dump", action="store_true",
+                    help="imprime cada bloco com o valor e a origem, mais os blocos imutáveis")
+    cf.set_defaults(fn=_cmd_config)
+
+    ck = sub.add_parser("check", help="roda os hooks determinísticos declarados na política")
+    ck.add_argument("--quando", default=hooks.QUANDO_SEMPRE,
+                    help=f"momento a casar (default: {hooks.QUANDO_SEMPRE!r}); "
+                         f"hooks com quando={hooks.QUANDO_SEMPRE!r} sempre entram")
+    ck.add_argument("--todos", action="store_true",
+                    help="roda todos os hooks declarados, seja qual for o `quando`")
+    ck.add_argument("--cwd", help="diretório de trabalho dos hooks (default: o atual)")
+    ck.add_argument("--timeout", type=float, default=hooks.DEFAULT_TIMEOUT_S,
+                    help=f"teto por hook, em segundos (default: {hooks.DEFAULT_TIMEOUT_S})")
+    ck.add_argument("--label", help="rótulo para os eventos `verify` na trilha")
+    ck.set_defaults(fn=_cmd_check)
+
+    im = sub.add_parser("improve", help="lê a trilha e PROPÕE alteração de política (nunca aplica sozinho)")
+    im.add_argument("--apply", metavar="ID",
+                    help="autoriza uma proposta já gravada; exige --policy nomeando o arquivo a editar")
+    im.add_argument("--trilha", help="trilha de auditoria a analisar (default: a de FPCH_AUDIT_LOG / ~/.fpch)")
+    im.add_argument("--propostas", help="diretório das propostas (default: FPCH_PROPOSTAS_DIR / ~/.fpch/propostas)")
+    im.add_argument("--label", help="rótulo para os eventos de recusa na trilha")
+    im.set_defaults(fn=_cmd_improve)
+
+    au = sub.add_parser("audit", help="resumo de uso por pool")
+    au.add_argument("--verify", action="store_true",
+                    help="confere o encadeamento de hashes da trilha, em vez do resumo por pool")
+    au.add_argument("--trilha", help="trilha de auditoria a conferir (default: a de FPCH_AUDIT_LOG / ~/.fpch)")
+    au.set_defaults(fn=_cmd_audit)
 
     cc = sub.add_parser("cite-check", help="valida citações file:line contra o disco (sem LLM)")
     cc.add_argument("file", help="markdown a validar")
     cc.add_argument("root", help="raiz do código citado")
     cc.set_defaults(fn=_cmd_cite_check)
+
+    qc = sub.add_parser("quote-check",
+                        help="valida trechos entre aspas contra o texto da fonte (sem LLM)")
+    qc.add_argument("fiche", help="fichamento markdown a validar")
+    qc.add_argument("source", help="texto integral da fonte (extraído do PDF)")
+    qc.add_argument("--emit-block", action="store_true",
+                    help="imprime o bloco markdown para embutir na ficha")
+    qc.set_defaults(fn=_cmd_quote_check)
 
     sc = sub.add_parser("canib", help="canibaliza repos/artigos")
     csub = sc.add_subparsers(dest="canib_cmd", required=True)
@@ -275,7 +530,25 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
-    return args.fn(args)
+
+    # UMA carga, antes de qualquer trabalho. Falha aqui derruba o processo com
+    # mensagem legível e código 2: política malformada não degrada em silêncio
+    # nem é descoberta no meio de uma execução já com efeito colateral no disco.
+    try:
+        pol = policy.load(args.policy)
+        catalogo = models.catalog_from_policy(pol)
+    except (policy.PolicyError, models.CatalogError) as exc:
+        print(f"erro de política: {exc}", file=sys.stderr)
+        return EXIT_USO
+
+    args.policy_obj = pol
+    args.catalog = catalogo
+
+    # O catálogo derivado fica em vigor só durante este subcomando: é assim que
+    # `router.plan/route` — que ainda não recebem catálogo por parâmetro — passam
+    # a enxergar a política sem que o estado vaze para o processo inteiro.
+    with models.use_catalog(catalogo):
+        return args.fn(args)
 
 
 if __name__ == "__main__":

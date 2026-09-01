@@ -4,10 +4,22 @@ version = "0.1.0"
 description = "Personal Harness Constructor Framework — roteador multi-modelo e canibalizador de artefatos"
 readme = "README.md"
 requires-python = ">=3.11"
+# Sem dependência externa, por decisão de arquitetura: o FPCH é instalado na
+# máquina de quem já usa CLIs de agent de terceiros, e cada dependência a mais é
+# superfície de ataque a mais na fase de instalação — que a literatura de 2026
+# mostra ser o ponto frágil do agente de configuração. TOML entra por `tomllib`,
+# que é biblioteca padrão desde o 3.11.
 dependencies = []
+
+[dependency-groups]
+dev = ["pytest>=8"]
 
 [project.scripts]
 fpch = "fpch.cli:main"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
 
 [build-system]
 requires = ["hatchling"]

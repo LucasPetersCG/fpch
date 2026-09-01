@@ -24,6 +24,25 @@ defesas, em camadas:
   3. A adoção é uma PROPOSTA que o autor lê e aplica à mão. O FPCH não se
      auto-modifica a partir daqui. (Fundamento: Huang et al., ICLR 2024, Tier A —
      auto-correção sem feedback externo degrada. Ver docs/referencias/estado-da-arte-2026-07.md)
+
+ONDE MORA O PORTÃO, e por que ele mudou de lugar:
+O portão de aprovação nasceu na CLI (`cli.py`), e ali ele protegia apenas quem
+entrava pela CLI. Qualquer chamador programático — um teste, um script, um agente
+com `--allow-write`, uma onda futura deste mesmo projeto — chegava a `run()` sem
+passar por barreira alguma, porque `run()` recebia um `Target` já pronto e ia
+direto ao roteador. Uma invariante de segurança que reside na *interface* não é
+invariante: é convenção, e convenção só vale para quem a conhece.
+
+Por isso a conferência de `target.status` passou para a ENTRADA de `run()`, que é
+a fronteira do módulo — o ponto por onde todo caminho de execução obrigatoriamente
+passa. O portão da CLI permanece, e continua útil: ele dá a mensagem boa ao humano
+(«aprove com: fpch canib accept <id>») antes de a exceção precisar existir. O que
+ele deixou de ser é a *única* barreira.
+
+Isto não é rigor decorativo. Este módulo declara acima que o conteúdo ingerido é
+hostil por premissa; um portão que só existe na interface protege a premissa
+apenas contra o usuário distraído, nunca contra o código que o contorna — que é
+exatamente o anti-padrão que o trabalho condena ao tratar de agentes com escrita.
 """
 
 from __future__ import annotations
@@ -48,6 +67,25 @@ STATUS_DONE = "done"
 
 FOCUS_CONCEPT = "conceito"
 FOCUS_FUNCTION = "funcao"
+
+
+class TargetNotApprovedError(RuntimeError):
+    """Alvo chegou a `run()` sem aprovação humana.
+
+    Herda de `RuntimeError` de propósito: a CLI já captura `RuntimeError` no
+    caminho de `canib run` (`cli.py`), então o portão da fronteira degrada para
+    uma mensagem de erro legível em vez de um traceback, sem que a CLI precise
+    mudar. Quem quiser distinguir o caso captura a classe específica.
+    """
+
+    def __init__(self, target_id: str, status: str) -> None:
+        self.target_id = target_id
+        self.status = status
+        super().__init__(
+            f"alvo {target_id} está '{status}', não '{STATUS_ACCEPTED}': "
+            f"a canibalização exige aprovação humana explícita.\n"
+            f"aprove com:  fpch canib accept {target_id}"
+        )
 
 
 @dataclass
@@ -339,7 +377,17 @@ def run(
     (barato, tolera modelo médio); PROPOR é juízo arquitetural sobre o FPCH
     (caro, precisa de modelo forte). Rotear os dois igual desperdiça cota ou
     entrega juízo raso.
+
+    Levanta `TargetNotApprovedError` se `target.status` não for
+    `STATUS_ACCEPTED`. A conferência é a PRIMEIRA coisa que acontece, antes de
+    qualquer montagem de prompt e muito antes de o roteador ser tocado: o alvo
+    não aprovado não deve custar nem uma invocação de backend. Não é `assert`
+    porque `assert` some com `python -O` — invariante de segurança que evapora
+    sob otimização não é invariante.
     """
+    if target.status != STATUS_ACCEPTED:
+        raise TargetNotApprovedError(target.id, target.status)
+
     note_block = f"\nContexto dado pelo autor: {target.note}\n" if target.note else ""
 
     extra_dirs: list[Path] = []

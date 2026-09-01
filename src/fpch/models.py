@@ -7,12 +7,30 @@ Conceito central: POOL DE COTA. O mesmo CLI (`agy`) fala com modelos que
 consomem cotas DIFERENTES e independentes. Rotear ignorando o pool desperdiça
 a folga de um enquanto esgota o outro — é o erro que este módulo existe para
 evitar.
+
+**Catálogo embutido e catálogo em vigor (Onda 2A).** `CATALOG` continua sendo o
+default embutido, byte a byte o que sempre foi — `tests/test_policy.py` prova que
+`policy._DEFAULT_MODELS` o espelha, e essa prova só vale enquanto `CATALOG` for
+uma constante literal. O que a Onda 2A acrescenta é a possibilidade de **derivar**
+um catálogo de uma `Policy` já carregada (`catalog_from_policy`) e de colocá-lo
+*em vigor* durante uma execução (`use_catalog`), sem reescrever a constante.
+
+Este módulo **não importa `fpch.policy`** em tempo de execução, de propósito: a
+conversão lê apenas `policy.modelos` de forma estrutural (`.id`, `.pool`, …), o
+que mantém a direção da dependência em `policy → (ninguém)` e permite testar a
+conversão com qualquer objeto que tenha o mesmo formato.
 """
 
 from __future__ import annotations
 
+from collections.abc import Iterator, Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass
 from enum import Enum
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:  # pragma: no cover - só para o verificador de tipos
+    from .policy import ModelEntry, Policy
 
 
 class Pool(str, Enum):
@@ -86,17 +104,140 @@ CATALOG: tuple[Model, ...] = (
           notes="Backend mais maduro: reporta AI credits, tem --max-ai-credits e allowlist."),
 )
 
+#: Índice do catálogo **em vigor**, por `id`.
+#:
+#: Começa como o índice do default embutido e volta a ele sempre que `use_catalog`
+#: sai de escopo. É mutado *no lugar* (nunca rebindado) porque `router.py` faz
+#: `from .models import BY_ID` no import: quem já segura a referência precisa ver
+#: a mesma troca que `candidates()` vê, sob pena de `--model` e a cadeia de
+#: escalada passarem a discordar sobre qual catálogo está valendo.
 BY_ID: dict[str, Model] = {m.id: m for m in CATALOG}
 
 
-def candidates(task: TaskClass, exclude_pools: frozenset[Pool] = frozenset()) -> list[Model]:
+class CatalogError(ValueError):
+    """Entrada de catálogo que cita um pool ou uma classe de tarefa inexistente.
+
+    É erro, e não aviso: um catálogo com pool desconhecido não tem como ser
+    roteado, e seguir adiante ignorando a entrada faria o `fpch` operar com um
+    catálogo silenciosamente diferente do que está escrito na política — o modo
+    de falha que a seção 3 da fatia funcional proíbe.
+    """
+
+
+def model_from_entry(entry: ModelEntry) -> Model:
+    """Converte uma entrada de política (dado simples) num `Model` tipado.
+
+    `pool` e `good_for` chegam como texto e saem como `Pool`/`TaskClass`. Valor
+    fora do conjunto conhecido levanta `CatalogError` nomeando o modelo, o campo
+    e os valores aceitos — nunca é descartado nem substituído por um default.
+    """
+    try:
+        pool = Pool(entry.pool)
+    except ValueError:
+        raise CatalogError(
+            f"modelo {entry.id!r}: pool desconhecido {entry.pool!r} "
+            f"(válidos: {sorted(p.value for p in Pool)})"
+        ) from None
+
+    classes: list[TaskClass] = []
+    for nome in entry.good_for:
+        try:
+            classes.append(TaskClass(nome))
+        except ValueError:
+            raise CatalogError(
+                f"modelo {entry.id!r}: classe de tarefa desconhecida em good_for: {nome!r} "
+                f"(válidas: {sorted(c.value for c in TaskClass)})"
+            ) from None
+
+    return Model(
+        id=entry.id,
+        backend=entry.backend,
+        pool=pool,
+        power=entry.power,
+        cost=entry.cost,
+        good_for=tuple(classes),
+        notes=entry.notes or "",
+    )
+
+
+def catalog_from_policy(policy: Policy) -> tuple[Model, ...]:
+    """Catálogo derivado de uma `Policy` já carregada.
+
+    A ordem do arquivo é preservada: dentro de um pool, o primeiro que serve à
+    classe continua sendo o preferido em caso de empate — a mesma regra que
+    `CATALOG` documenta, agora sob controle de quem escreve a política.
+    """
+    return tuple(model_from_entry(e) for e in policy.modelos)
+
+
+def index_by_id(catalog: Sequence[Model]) -> dict[str, Model]:
+    """Índice `id -> Model` de um catálogo qualquer."""
+    return {m.id: m for m in catalog}
+
+
+# --------------------------------------------------------------------------
+# Catálogo em vigor
+#
+# Costura deliberadamente pequena. `router.plan()`/`router.route()` não recebem
+# catálogo por parâmetro — `router.py` pertence a outra onda desta rodada e não
+# pode ser editado aqui —, então o catálogo em vigor é um estado de módulo que
+# `candidates()` consulta como default e que `use_catalog()` troca durante um
+# escopo bem delimitado (a CLI embrulha UMA execução de subcomando).
+#
+# Isto é um andaime, não o desenho final: a forma correta é o catálogo descer
+# como parâmetro explícito de `router.plan/route`. Registrado aqui para que a
+# onda que puder tocar `router.py` remova o estado global em vez de herdá-lo.
+# --------------------------------------------------------------------------
+
+_CATALOGO_EM_VIGOR: tuple[Model, ...] = CATALOG
+
+
+def active_catalog() -> tuple[Model, ...]:
+    """O catálogo em vigor — o embutido, ou o que `use_catalog()` colocou no lugar."""
+    return _CATALOGO_EM_VIGOR
+
+
+@contextmanager
+def use_catalog(catalog: Sequence[Model]) -> Iterator[tuple[Model, ...]]:
+    """Coloca `catalog` em vigor durante o bloco e restaura o anterior ao sair.
+
+    Restaura mesmo em caso de exceção: um catálogo que vaza de uma execução para
+    a seguinte faria dois comandos idênticos responderem coisas diferentes, e
+    seria justamente o tipo de estado invisível que esta ferramenta existe para
+    não ter.
+    """
+    global _CATALOGO_EM_VIGOR
+    anterior = _CATALOGO_EM_VIGOR
+    anterior_by_id = dict(BY_ID)
+    _CATALOGO_EM_VIGOR = tuple(catalog)
+    BY_ID.clear()
+    BY_ID.update(index_by_id(_CATALOGO_EM_VIGOR))
+    try:
+        yield _CATALOGO_EM_VIGOR
+    finally:
+        _CATALOGO_EM_VIGOR = anterior
+        BY_ID.clear()
+        BY_ID.update(anterior_by_id)
+
+
+def candidates(
+    task: TaskClass,
+    exclude_pools: frozenset[Pool] = frozenset(),
+    catalog: Sequence[Model] | None = None,
+) -> list[Model]:
     """Modelos que servem à classe, do mais barato ao mais caro.
 
     Empate de custo é desfeito por potência decrescente: entre dois modelos que
     custam o mesmo, pegar o mais forte é grátis.
+
+    `catalog=None` usa o catálogo em vigor (`active_catalog()`), que por sua vez
+    é o default embutido enquanto ninguém tiver chamado `use_catalog()`. O
+    parâmetro é o terceiro e opcional de propósito: `candidates(task, pools)`
+    continua significando exatamente o que significava antes.
     """
+    fonte = active_catalog() if catalog is None else catalog
     viable = [
-        m for m in CATALOG
+        m for m in fonte
         if task in m.good_for and m.pool not in exclude_pools
     ]
     return sorted(viable, key=lambda m: (m.cost, -m.power))
