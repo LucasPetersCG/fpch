@@ -2,7 +2,7 @@
 
 > 🧭 **Mapa de docs:** [`AGENTS.md`](../AGENTS.md) · [`docs/PROJECT.md`](../docs/PROJECT.md) · [`docs/STATUS.md`](../docs/STATUS.md) · [`TODO.md`](../TODO.md) · [`docs/analises/camada-multi-modelo.md`](../docs/analises/camada-multi-modelo.md) · [`docs/referencias/estado-da-arte-2026-07.md`](../docs/referencias/estado-da-arte-2026-07.md)
 
-Primeiro código do FPCH. Cobre **C1** (camada de acesso multi-modelo) e a ferramenta **cannibalize**.
+Código do FPCH. Nasceu cobrindo **C1** (camada de acesso multi-modelo) e a ferramenta **cannibalize**; desde a fatia funcional de 01/09/2026 instancia **as cinco camadas do framework** — política (`policy.py`), hooks determinísticos (`hooks.py`), laço de autoaprimoramento (`improve.py`), trilha verificável (`audit.py` + `fpch audit --verify`) e acesso multi-modelo (`router.py`/`backends.py`/`models.py`). **12 arquivos, 4.940 linhas, 235 testes passando** (medido em 02/09/2026).
 
 **Status:** funcional e verificado ponta a ponta em 16/07/2026. Stack escolhida nesta sessão (C1 estava aberto): **Python ≥3.11 + uv**. Zero dependências de runtime — só a stdlib e os CLIs oficiais já instalados.
 
@@ -64,4 +64,4 @@ Essa é a linha real entre uso pretendido e banimento: o ilícito é **mentir so
 - `gemini` CLI **inutilizável** nesta conta (`IneligibleTierError`) — não está no catálogo.
 - `ollama` e `litellm` **não instalados** — a camada API-key (LiteLLM) ainda não existe. Só a camada assinatura está implementada.
 - Custo/potência dos modelos são **juízo do autor**, não medição. O audit log existe justamente para substituir isso por dado.
-- Sem testes automatizados ainda.
+- ~~Sem testes automatizados ainda.~~ **Superado:** 235 testes em `tests/` (11 arquivos, 3.164 linhas), `uv run --with pytest pytest tests/ -q`. Os demais limites desta lista são de 16/07/2026 e não foram reconferidos.
