@@ -6,6 +6,9 @@
     fpch config --dump               política efetiva, bloco a bloco, com a origem
     fpch check                       roda os hooks determinísticos da política
     fpch audit                       para onde a cota foi
+    fpch audit --verify              confere o encadeamento de hashes da trilha
+    fpch audit --causes              causa raiz e fonte, agregadas
+    fpch audit --process             marcos do processo de falha, por trajetória
     fpch improve                     lê a trilha e PROPÕE mudança de política (não aplica)
     fpch --policy P improve --apply <id>   autoriza uma proposta, no arquivo que você nomeou
     fpch quote-check <ficha> <fonte> trechos entre aspas existem na fonte?
@@ -275,8 +278,33 @@ def _cmd_improve(args: argparse.Namespace) -> int:
 def _cmd_audit(args: argparse.Namespace) -> int:
     trilha = Path(args.trilha) if getattr(args, "trilha", None) else None
 
-    if getattr(args, "verify", False):
+    verify = getattr(args, "verify", False)
+    causes = getattr(args, "causes", False)
+    process = getattr(args, "process", False)
+
+    # --verify, --causes e --process são mutuamente exclusivas. Fazer as duas
+    # coisas pela metade (spec da fatia, §3) é pior do que escolher uma — e o
+    # argparse recusar a combinação devolveria código 2 ("não chegou a
+    # rodar"), errado aqui: o comando é válido, só ambíguo. A CLI resolve por
+    # uma ordem de precedência fixa (verify > causes > process — íntegro
+    # antes de citável) e AVISA em stderr qual flag prevaleceu, para que
+    # ninguém leia a saída de uma flag pensando que é de outra.
+    if verify and (causes or process):
+        outras = ", ".join(n for n, v in (("--causes", causes), ("--process", process)) if v)
+        print(f"fpch: --verify e {outras} foram passados juntos — --verify prevalece.",
+              file=sys.stderr)
         return _cmd_audit_verify(trilha)
+    if verify:
+        return _cmd_audit_verify(trilha)
+
+    if causes and process:
+        print("fpch: --causes e --process foram passados juntos — --causes prevalece.",
+              file=sys.stderr)
+        return _cmd_audit_causes(trilha)
+    if causes:
+        return _cmd_audit_causes(trilha)
+    if process:
+        return _cmd_audit_process(trilha)
 
     s = audit.summary(trilha)
     if not s["total_calls"]:
@@ -328,6 +356,122 @@ def _cmd_audit_verify(trilha: Path | None) -> int:
         return 1
 
     print(f"trilha íntegra — {conferidas} linha(s) conferida(s).")
+    return 0
+
+
+def _cmd_audit_causes(trilha: Path | None) -> int:
+    """`fpch audit --causes` — causa raiz e fonte, agregadas por `audit.summary()`.
+
+    Duas tabelas, cada uma com um balde `"?"` para vocabulário fora do
+    vocabulário vigente (linha antiga, esquema anterior). O balde nunca é
+    escondido: esconder o que não se entendeu é o oposto do que esta trilha
+    existe para fazer. Trilha sem nada classificado não é erro — é ausência
+    de dado — por isso a saída é uma frase honesta e o código é 0.
+    """
+    s = audit.summary(trilha)
+    by_cause: dict = s["by_cause"]
+    by_source: dict = s["by_source"]
+
+    if not by_cause and not by_source:
+        print("nenhuma causa registrada ainda nesta trilha.")
+        return 0
+
+    print("causa raiz")
+    if not by_cause:
+        print("  nenhuma causa registrada ainda nesta trilha.")
+    else:
+        print(f"  {'categoria / subtipo':<32}{'total':>7}")
+        for categoria in (*audit.CAUSE_TAXONOMY, "?"):
+            balde = by_cause.get(categoria)
+            if not balde:
+                continue
+            print(f"  {categoria:<32}{balde['total']:>7}")
+            subtipos = balde["subtypes"]
+            ordem = audit.CAUSE_TAXONOMY.get(categoria, ())
+            chaves = [s2 for s2 in ordem if s2 in subtipos]
+            chaves += sorted(s2 for s2 in subtipos if s2 not in ordem)
+            for subtipo in chaves:
+                print(f"    {subtipo:<30}{subtipos[subtipo]:>7}")
+
+    print()
+    print("fonte")
+    if not by_source:
+        print("  nenhuma fonte registrada ainda nesta trilha.")
+    else:
+        print(f"  {'source / source_ref':<32}{'total':>7}")
+        for fonte in (*audit.SOURCES, "?"):
+            balde = by_source.get(fonte)
+            if not balde:
+                continue
+            print(f"  {fonte:<32}{balde['total']:>7}")
+            for ref in sorted(balde["refs"]):
+                print(f"    {ref:<30}{balde['refs'][ref]:>7}")
+
+    return 0
+
+
+#: Nota de granularidade das derivadas de `audit.failure_process()`. Reaproveita
+#: a formulação do docstring de `failure_process` (fonte da verdade) em vez de
+#: inventar uma nova — é o que impede alguém de ler `fix_window` /
+#: `observability_lag` como se fossem a métrica de Zhao et al. (2026).
+_NOTA_GRANULARIDADE = (
+    "nota de granularidade: fix_window e observability_lag são medidos em "
+    "EVENTOS DA TRILHA, não em turnos internos do agente. Zhao et al. (2026) "
+    "medem passos de raciocínio-e-ação dentro de uma execução; o FPCH "
+    "registra uma linha por chamada de backend. A adoção aqui é da estrutura "
+    "conceitual — três marcos e duas derivadas —, não da unidade de medida. "
+    "Comparar os números desta tabela com os números do artigo seria erro de "
+    "leitura."
+)
+
+#: Legenda da marca de trajetória remarcada, impressa só quando alguma linha a usa.
+_NOTA_REMARCADO = (
+    "* marco remarcado nesta trajetória — o último valor anotado prevalece; "
+    "mudar de opinião sobre um rótulo retrospectivo é legítimo, escondê-lo não é."
+)
+
+
+def _fmt_marco(valor: int | None) -> str:
+    """Marco não anotado vira `—`, nunca `0` — zero é medida, traço é ausência dela."""
+    return "—" if valor is None else str(valor)
+
+
+def _cmd_audit_process(trilha: Path | None) -> int:
+    """`fpch audit --process` — marcos do processo de falha, por `audit.failure_process()`.
+
+    Uma linha por trajetória anotada: os `seq` de `t_err`/`t_lock`/`t_obs` e as
+    duas derivadas. `observability_lag` pode ser NEGATIVO — pela fórmula
+    `t_obs − t_lock`, valor negativo significa que o sinal do erro já era
+    observável ANTES do ponto de irrecuperabilidade, achado legítimo e não um
+    defeito de cálculo. Por isso o valor é impresso com sinal, nunca com
+    `abs()`, e a legenda de rodapé explica o sentido do negativo.
+    """
+    marcos = audit.failure_process(trilha)
+    if not marcos:
+        print("nenhuma trajetória com marco anotado ainda nesta trilha.")
+        return 0
+
+    algum_remarcado = False
+    print(f"{'trajetória':<24}{'t_err':>7}{'t_lock':>8}{'t_obs':>7}"
+          f"{'fix_window':>12}{'obs_lag':>10}")
+    for tid in sorted(marcos):
+        m = marcos[tid]
+        marca = "*" if m["remarcado"] else ""
+        if m["remarcado"]:
+            algum_remarcado = True
+        print(f"{tid:<24}{_fmt_marco(m['t_err']):>7}{_fmt_marco(m['t_lock']):>8}"
+              f"{_fmt_marco(m['t_obs']):>7}{_fmt_marco(m['fix_window']):>12}"
+              f"{_fmt_marco(m['observability_lag']):>10}{marca}")
+
+    print()
+    if algum_remarcado:
+        print(_NOTA_REMARCADO)
+    print(
+        "nota: observability_lag negativo significa que o sinal do erro era "
+        "observável ANTES do ponto de irrecuperabilidade (t_lock) — achado "
+        "legítimo, não defeito de cálculo."
+    )
+    print(_NOTA_GRANULARIDADE)
     return 0
 
 
@@ -480,6 +624,10 @@ def build_parser() -> argparse.ArgumentParser:
     au = sub.add_parser("audit", help="resumo de uso por pool")
     au.add_argument("--verify", action="store_true",
                     help="confere o encadeamento de hashes da trilha, em vez do resumo por pool")
+    au.add_argument("--causes", action="store_true",
+                    help="causa raiz e fonte agregadas (audit.summary().by_cause / by_source)")
+    au.add_argument("--process", action="store_true",
+                    help="marcos do processo de falha por trajetória (audit.failure_process())")
     au.add_argument("--trilha", help="trilha de auditoria a conferir (default: a de FPCH_AUDIT_LOG / ~/.fpch)")
     au.set_defaults(fn=_cmd_audit)
 

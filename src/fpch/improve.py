@@ -229,12 +229,21 @@ def trajetorias_integras(trilha: Path | None = None) -> tuple[set[str], int | No
 
 @dataclass(frozen=True)
 class Recusa:
-    """Uma proposta que não nasceu, com a razão em código estável e em texto."""
+    """Uma proposta que não nasceu, com a razão em código estável e em texto.
+
+    `regra` só é preenchida quando a recusa nasce depois de uma `Regra` já ter
+    sido identificada (por exemplo `RECUSA_SEM_MUDANCA`, cuja evidência casou com
+    `REGRA_TIMEOUT`/`REGRA_ASSINATURA` mas não há o que alterar). É o que permite
+    ao evento gravado na trilha carregar `source="politica"` com um
+    `source_ref` concreto — sem inventar fonte para recusa que nunca chegou a
+    identificar regra nenhuma.
+    """
 
     codigo: str
     mensagem: str
     trajectory_id: str = ""
     component: str = ""
+    regra: str | None = None
 
     def __str__(self) -> str:
         onde = f" [{self.trajectory_id}/{self.component}]" if self.trajectory_id else ""
@@ -361,7 +370,7 @@ def _proposta_de(regra: Regra, gatilho: str, ev: dict, pol: Policy) -> tuple[Pro
                 RECUSA_SEM_MUDANCA,
                 f"[backends].timeout_s já está em {atual}s, no teto de {TETO_TIMEOUT_S}s que este "
                 "laço pode pedir. Um teto maior é decisão do autor, não do laço.",
-                tid, comp,
+                tid, comp, regra.nome,
             )
         proposto = min(atual * 2, TETO_TIMEOUT_S)
         justificativa = (
@@ -383,7 +392,7 @@ def _proposta_de(regra: Regra, gatilho: str, ev: dict, pol: Policy) -> tuple[Pro
                 RECUSA_SEM_MUDANCA,
                 f"a assinatura {gatilho!r} já consta de [falha].assinaturas; a política já reconhece "
                 "esta condição como falha e não há o que acrescentar.",
-                tid, comp,
+                tid, comp, regra.nome,
             )
         proposto = tuple(atual_tupla) + (gatilho,)
         atual = atual_tupla
@@ -481,10 +490,17 @@ def _diagnostica(ev: dict, pol: Policy, integras: set[str], quebra: int | None
 # ---------------------------------------------------------------------------
 
 def _registra(componente: str, verdict: str, evidence: str, *,
-              trajectory_id: str, trilha: Path | None, label: str | None = None) -> bool:
+              trajectory_id: str, trilha: Path | None, label: str | None = None,
+              source: str | None = None, source_ref: str | None = None) -> bool:
     """Grava a decisão do portão como evento `verify`.
 
     `fault_side` fica vazio de propósito — ver o docstring do módulo.
+
+    `source`/`source_ref` também ficam vazios por padrão, pelo mesmo motivo: nem
+    toda decisão deste portão nasce de uma regra de política identificada (por
+    exemplo, evidência ausente ou trilha sem candidato algum). Só os chamadores
+    que sabem qual `Regra` (ou qual `policy_path`) está em jogo preenchem os dois
+    — campo vazio é honesto, chute não é.
     """
     tid = trajectory_id or f"improve-{uuid.uuid4().hex[:12]}"
     return audit.write(
@@ -496,6 +512,8 @@ def _registra(componente: str, verdict: str, evidence: str, *,
             component=componente,
             verdict=verdict,
             evidence=evidence[:500],
+            source=source,
+            source_ref=source_ref,
         ),
         path=trilha,
     )
@@ -572,8 +590,13 @@ def propor(pol: Policy, *, trilha: Path | None = None, propostas_dir: Path | Non
             recusas.append(recusa)
 
     for r in recusas:
+        # Só a recusa que já identificou uma `Regra` (RECUSA_SEM_MUDANCA) tem
+        # fonte determinável — as demais (evidência ausente, cadeia quebrada,
+        # lado do modelo, sem regra que case) nunca chegaram a uma regra de
+        # política, e `r.regra` fica `None` para provar isso.
         _registra(COMPONENTE_PROPOR, "fail", str(r), trajectory_id=r.trajectory_id,
-                  trilha=trilha, label=label)
+                  trilha=trilha, label=label,
+                  source="politica" if r.regra else None, source_ref=r.regra)
     return Analise(recusas=tuple(recusas), trilha=trilha, quebra=quebra)
 
 
@@ -661,12 +684,17 @@ def escreve_chave(texto: str, bloco: str, campo: str, valor: object) -> str:
 # ---------------------------------------------------------------------------
 
 def _recusa_aplicacao(codigo: str, mensagem: str, prop_id: str, tid: str, comp: str,
-                      *, trilha: Path | None, uso: bool = False) -> ResultadoAplicacao:
-    recusa = Recusa(codigo, mensagem, tid, comp)
+                      *, trilha: Path | None, uso: bool = False,
+                      regra: str | None = None) -> ResultadoAplicacao:
+    """`regra` só chega preenchida quando `dados` (a proposta já carregada e com
+    schema conferido) existe — antes disso não há regra de política a apontar
+    como fonte, e o campo fica `None` de propósito."""
+    recusa = Recusa(codigo, mensagem, tid, comp, regra)
     ok_trilha = _registra(
         COMPONENTE_APLICAR, "fail",
         f"proposta {prop_id}: {recusa}",
         trajectory_id=tid, trilha=trilha,
+        source="politica" if regra else None, source_ref=regra,
     )
     return ResultadoAplicacao(
         ok=False, proposta_id=prop_id, recusa=recusa, trilha_ok=ok_trilha, uso_incorreto=uso,
@@ -718,7 +746,7 @@ def aplicar(proposta_id: str, *, policy_path: Path, trilha: Path | None = None,
             f"o bloco {bloco!r} está em IMMUTABLE_BLOCKS (seção 5.3): é ele próprio a defesa contra "
             "conteúdo hostil, e por isso não é externalizável. Aplicar aqui entregaria a defesa ao "
             "mesmo laço automatizado que ela existe para conter.",
-            proposta_id, tid, comp, trilha=trilha,
+            proposta_id, tid, comp, trilha=trilha, regra=dados.get("regra"),
         )
 
     if bloco not in BLOCOS_EXTERNALIZAVEIS or not campo:
@@ -726,7 +754,7 @@ def aplicar(proposta_id: str, *, policy_path: Path, trilha: Path | None = None,
             RECUSA_BLOCO_INEXISTENTE,
             f"bloco {bloco!r} / campo {campo!r} não é bloco externalizável da seção 5.2 "
             f"(válidos: {', '.join(BLOCOS_EXTERNALIZAVEIS)}).",
-            proposta_id, tid, comp, trilha=trilha,
+            proposta_id, tid, comp, trilha=trilha, regra=dados.get("regra"),
         )
 
     eventos = audit.read_all(trilha)
@@ -735,7 +763,7 @@ def aplicar(proposta_id: str, *, policy_path: Path, trilha: Path | None = None,
             RECUSA_TRAJETORIA_AUSENTE,
             f"a trajetória {tid!r} citada pela proposta não existe na trilha. Proposta que aponta "
             "para evidência inexistente não é proposta, é alegação.",
-            proposta_id, tid, comp, trilha=trilha,
+            proposta_id, tid, comp, trilha=trilha, regra=dados.get("regra"),
         )
 
     integras, quebra = trajetorias_integras(trilha)
@@ -747,7 +775,7 @@ def aplicar(proposta_id: str, *, policy_path: Path, trilha: Path | None = None,
             + f"; a trajetória {tid!r} deixou de ser auditável entre a proposta e a aplicação. "
             "A evidência foi conferida na proposta e é reconferida aqui exatamente porque o "
             "arquivo pode ter mudado nesse intervalo.",
-            proposta_id, tid, comp, trilha=trilha,
+            proposta_id, tid, comp, trilha=trilha, regra=dados.get("regra"),
         )
 
     try:
@@ -757,7 +785,7 @@ def aplicar(proposta_id: str, *, policy_path: Path, trilha: Path | None = None,
             RECUSA_POLITICA_INVALIDA,
             f"a política em {policy_path} não carrega hoje: {exc}. Aplicar sobre um arquivo já "
             "quebrado esconderia o defeito original.",
-            proposta_id, tid, comp, trilha=trilha, uso=True,
+            proposta_id, tid, comp, trilha=trilha, uso=True, regra=dados.get("regra"),
         )
 
     try:
@@ -766,7 +794,7 @@ def aplicar(proposta_id: str, *, policy_path: Path, trilha: Path | None = None,
         return _recusa_aplicacao(
             RECUSA_BLOCO_INEXISTENTE,
             f"a política não tem o campo {bloco}.{campo}.",
-            proposta_id, tid, comp, trilha=trilha,
+            proposta_id, tid, comp, trilha=trilha, regra=dados.get("regra"),
         )
 
     esperado = dados.get("valor_atual")
@@ -775,7 +803,7 @@ def aplicar(proposta_id: str, *, policy_path: Path, trilha: Path | None = None,
             RECUSA_VALOR_DIVERGENTE,
             f"{bloco}.{campo} vale {vigente!r} hoje, mas a proposta foi calculada sobre "
             f"{esperado!r}. A política mudou desde a análise; refaça `fpch improve`.",
-            proposta_id, tid, comp, trilha=trilha,
+            proposta_id, tid, comp, trilha=trilha, regra=dados.get("regra"),
         )
 
     original = policy_path.read_text(encoding="utf-8") if policy_path.exists() else ""
@@ -785,7 +813,7 @@ def aplicar(proposta_id: str, *, policy_path: Path, trilha: Path | None = None,
         return _recusa_aplicacao(
             RECUSA_BLOCO_INEXISTENTE,
             f"valor proposto não é serializável nesta fatia: {exc}.",
-            proposta_id, tid, comp, trilha=trilha,
+            proposta_id, tid, comp, trilha=trilha, regra=dados.get("regra"),
         )
 
     policy_path.parent.mkdir(parents=True, exist_ok=True)
@@ -801,15 +829,20 @@ def aplicar(proposta_id: str, *, policy_path: Path, trilha: Path | None = None,
             RECUSA_POLITICA_INVALIDA,
             f"a política resultante não carregaria ({exc}); o arquivo foi restaurado ao estado "
             "anterior. Nunca se deixa para trás uma política quebrada.",
-            proposta_id, tid, comp, trilha=trilha,
+            proposta_id, tid, comp, trilha=trilha, regra=dados.get("regra"),
         )
 
     aplicado = f"{bloco}.{campo}: {dados.get('valor_atual')!r} → {dados.get('valor_proposto')!r}"
+    # A aplicação bem-sucedida é o caso mais concreto de fonte determinável deste
+    # módulo: a mudança nasceu da regra `dados["regra"]` e foi escrita neste
+    # `policy_path` — os dois identificadores concretos que `source_ref` pede.
     trilha_ok = _registra(
         COMPONENTE_APLICAR, "pass",
         f"proposta {proposta_id} aplicada em {policy_path}: {aplicado}. "
         f"Remoção prevista: {dados.get('remocao')}",
         trajectory_id=tid, trilha=trilha,
+        source="politica" if dados.get("regra") else None,
+        source_ref=f"{dados.get('regra')}@{policy_path}" if dados.get("regra") else None,
     )
 
     marcado = dict(dados)

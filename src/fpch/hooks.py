@@ -26,12 +26,25 @@ nunca rodou não significa sucesso, significa que ninguém olhou.
 Sobre o diagnóstico de causa: um hook determinístico que reprova é, por construção,
 evidência do lado da infraestrutura ou do artefato produzido — nunca do modelo, que
 não participa desta camada. Daí `fault_side = "infraestrutura"` em toda reprovação.
-Já `cause_category` só é preenchida quando existe base objetiva (timeout, binário
-ausente, erro do sistema operacional ⇒ `"ambiente"`). Um `pytest` que reprova não
-diz, por si, se a causa foi epistêmica ou de competência — e a Fase 5 (`improve.py`)
+Já `cause_category` só é preenchida quando existe base objetiva. Quando a execução
+não chega a acontecer, a categoria é objetiva por construção — o processo não rodou,
+logo a falha nasceu fora do que o hook deveria julgar, que é a definição de
+`"ambiente"`. Muda o subtipo, não a categoria: timeout e binário ausente/não
+executável são `"bloqueio_de_ambiente"`; a recusa genérica do sistema operacional
+(permissão negada, diretório inválido, outro `OSError`) é `"outro"`, que é o slot
+residual que a própria taxonomia adotada oferece. Deixar essas em branco pareceria
+prudência e seria perda: some do agregado por causa justamente a falha que ninguém
+investigou, e foi para impedir esse tipo de sumiço silencioso que o vocabulário
+fechado existe.
+
+O caso genuinamente indeterminado é outro, e nele o campo fica vazio: um `pytest`
+que reprova **rodou** e não diz, por si, se a causa foi epistêmica ou de
+competência. Aí a categoria é desconhecida, não residual, e a Fase 5 (`improve.py`)
 vai ler este campo para decidir se pode propor alteração de política. Campo vazio é
 melhor que campo inventado: um rótulo chutado aqui vira, lá adiante, uma proposta
-automatizada apoiada em evidência que não existe.
+automatizada apoiada em evidência que não existe. A distinção que o módulo sustenta
+é entre **categoria determinada com subtipo residual** (`ambiente`/`outro`) e
+**categoria indeterminada** (vazio) — não entre situações conhecidas e o resto.
 
 Toda saída de comando é **dado**, nunca instrução. Ela é truncada, gravada e
 comparada — jamais interpretada.
@@ -93,6 +106,7 @@ class HookResult:
     exit_code: int | None = None
     duration_s: float = 0.0
     cause_category: str | None = None   # só quando há base objetiva
+    cause_subtype: str | None = None    # só válido dentro de cause_category
     fault_side: str | None = None       # "infraestrutura" nas reprovações
     #: A trilha aceitou o evento? `audit.write` devolve bool justamente para que
     #: a perda não seja invisível; propagar aqui é o que permite ao chamador
@@ -184,11 +198,20 @@ def _avalia(criterio: str, code: int, saida: str) -> tuple[str, str]:
 
 
 def _executa(cmd: list[str], cwd: Path, timeout_s: float) -> tuple[str, str, int | None, str | None]:
-    """Roda o comando. Devolve `(estado, evidence_ou_saida, exit_code, cause)`.
+    """Roda o comando. Devolve `(estado, evidence_ou_saida, exit_code, cause_subtype)`.
 
     `estado` é `"ok"` quando o processo rodou até o fim (aí o segundo item é a
     saída bruta), ou `"erro"` quando nem chegou lá (aí o segundo item já é a
     razão, pronta para virar evidência).
+
+    O quarto item é só o *subtipo* — nunca a categoria, que é fixa em `"ambiente"`
+    para todo caminho de exceção daqui e é responsabilidade de quem chama. Timeout
+    e binário ausente/não executável são `"bloqueio_de_ambiente"`; a recusa
+    genérica do sistema operacional (permissão negada, diretório inválido, outro
+    `OSError`) é `"outro"`, o slot residual da taxonomia. Devolver `None` aqui
+    faria a falha sumir do agregado por causa, que é o oposto do que este campo
+    existe para fazer — o subtipo residual é o registro honesto de "fora do
+    agente, não investigado além disso".
     """
     try:
         proc = subprocess.run(
@@ -207,7 +230,7 @@ def _executa(cmd: list[str], cwd: Path, timeout_s: float) -> tuple[str, str, int
             f"o hook estourou o timeout de {timeout_s}s e foi interrompido; "
             "sem veredito, isto é reprovação e não aprovação",
             None,
-            "ambiente",
+            "bloqueio_de_ambiente",
         )
     except FileNotFoundError:
         return (
@@ -215,14 +238,14 @@ def _executa(cmd: list[str], cwd: Path, timeout_s: float) -> tuple[str, str, int
             f"comando não encontrado no PATH: {cmd[0]!r}; "
             "hook declarado mas não executável não é hook que passou",
             None,
-            "ambiente",
+            "bloqueio_de_ambiente",
         )
     except (PermissionError, NotADirectoryError, OSError) as exc:
         return (
             "erro",
             f"o sistema operacional recusou a execução de {cmd[0]!r}: {exc}",
             None,
-            "ambiente",
+            "outro",
         )
 
     saida = (proc.stdout or "").strip()
@@ -260,6 +283,7 @@ def run_hook(
     cmd = list(hook.cmd)
 
     cause: str | None = None
+    cause_subtype: str | None = None
     lado: str | None = None
     exit_code: int | None = None
     inicio = _monotonic()
@@ -279,10 +303,15 @@ def run_hook(
             "não há o que executar, logo não há o que aprovar"
         )
     else:
-        estado, bruto, exit_code, cause_exec = _executa(cmd, destino, timeout_s)
+        estado, bruto, exit_code, subtipo_exec = _executa(cmd, destino, timeout_s)
         if estado == "erro":
             verdict, evidence = "fail", _truncate(bruto)
-            cause = cause_exec
+            if subtipo_exec is not None:
+                # As duas únicas situações objetivas desta camada — ver docstring
+                # de `_executa`. O terceiro caso (recusa genérica do SO) chega
+                # aqui com `subtipo_exec=None` e fica sem categoria: melhor vazio
+                # que chutado.
+                cause, cause_subtype = "ambiente", subtipo_exec
         else:
             verdict, evidence = _avalia(criterio, exit_code or 0, bruto)
 
@@ -310,7 +339,13 @@ def run_hook(
                 exit_code=exit_code,
                 latency_s=duracao,
                 cause_category=cause,
+                cause_subtype=cause_subtype,
                 fault_side=lado,
+                # Este módulo é a fonte: `source_ref` dá o nome do hook concreto,
+                # que é o que permite ir de "veio de um hook" a "veio do hook
+                # pytest" — ver a nota de `Event.source_ref` em audit.py.
+                source="hook",
+                source_ref=hook.nome,
             ),
             path=audit_path,
         )
@@ -323,6 +358,7 @@ def run_hook(
         exit_code=exit_code,
         duration_s=duracao,
         cause_category=cause,
+        cause_subtype=cause_subtype,
         fault_side=lado,
         trilha_ok=trilha_ok,
     )

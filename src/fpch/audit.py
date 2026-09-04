@@ -29,6 +29,18 @@ inteiro combate: promessa que falha lida como promessa cumprida. `write()` devol
 originou, porque perder a tarefa por causa do log seria trocar um problema por
 outro pior.
 
+**Vocabulário fechado é extensão da mesma doutrina.** `cause_category`,
+`cause_subtype`, `fault_side`, `source` e `mark` eram texto livre. Um erro de
+digitação não derrubava nada — apenas fazia a categoria sumir de todo agregado,
+sem aviso, que é a falha silenciosa contra a qual o módulo inteiro existe. Esses
+valores são escritos pelo próprio código do FPCH, nunca por entrada de usuário:
+valor inválido é defeito de programação, e o lugar de falhar é na construção do
+evento, antes de qualquer trabalho estar em risco. Daí `ValueError` em
+`__post_init__` — e nunca em `write()`, que mantém o contrato de não derrubar o
+chamador. Na leitura vale o oposto: linha antiga pode trazer vocabulário
+anterior, então o desconhecido é agregado sob `"?"` e contado em
+`counters()["unknown_vocab"]`, pelo mesmo princípio de `corrupt_lines`.
+
 Append-only. Nunca reescrever histórico: um log que o agente pode editar não é
 trilha de auditoria.
 """
@@ -43,10 +55,60 @@ from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from pathlib import Path
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 #: Desfechos válidos de uma trajetória.
 OUTCOMES = ("ok", "failed", "abandoned")
+
+#: Taxonomia de causa raiz adotada de Zhao et al. (2026), Tabela II, p. 6: três
+#: categorias mutuamente exclusivas e nove subtipos, derivadas da anotação manual
+#: de trajetórias de agentes reais. Os nomes ficam em português porque são
+#: vocabulário do FPCH; o termo original em inglês fica no comentário ao lado,
+#: porque é ele que torna a adoção rastreável até a fonte. Os percentuais são os
+#: da distribuição relatada no artigo — servem de referência de ordem de
+#: grandeza, não de expectativa a ser reproduzida por esta trilha.
+CAUSE_TAXONOMY: dict[str, tuple[str, ...]] = {
+    # epistemic (57,9%): o agente agiu sobre uma leitura errada do mundo
+    "epistemica": (
+        "premissa_falsa",               # false premise (30,7%)
+        "negligencia_de_especificacao",  # specification neglect (14,9%)
+        "leitura_errada_de_saida",      # output misreading (4,4%)
+        "sinal_ignorado",               # ignored signal (4,1%)
+        "acao_prematura",               # premature action (3,7%)
+    ),
+    # competence (32,8%): o agente sabia o que fazer e não conseguiu fazer
+    "competencia": (
+        "lacuna_de_conhecimento",       # knowledge gap (24,0%)
+        "limite_de_capacidade",         # capability limitation (8,8%)
+    ),
+    # environment (9,4%): a falha nasceu fora do agente
+    "ambiente": (
+        "bloqueio_de_ambiente",         # environment blocker (8,8%)
+        "outro",                        # other (0,6%)
+    ),
+}
+
+#: De que lado nasceu a falta. `"infraestrutura"` é o que os hooks já gravam.
+FAULT_SIDES = ("modelo", "infraestrutura")
+
+#: Qual parte do harness produziu o efeito registrado. Sem este campo, "o harness
+#: ajudou" é anedota: não há como ir do agregado até a peça responsável.
+SOURCES = ("nlah", "politica", "hook", "mcp", "memoria", "skill", "catalogo", "usuario")
+
+#: Marcos do processo de falha (Zhao et al., 2026). `t_err` é o erro decisivo,
+#: rotulado *retrospectivamente* sobre a trajetória inteira — não é
+#: necessariamente o primeiro erro; `t_lock` é o ponto após o qual a trajetória é
+#: empiricamente irrecuperável; `t_obs` é o primeiro sinal observável do erro.
+MARKS = ("t_err", "t_lock", "t_obs")
+
+#: Campos de vocabulário fechado cuja validação é uma pertinência simples. O
+#: `cause_subtype` fica de fora porque sua validade depende da categoria.
+_CLOSED_VOCAB: dict[str, tuple[str, ...]] = {
+    "cause_category": tuple(CAUSE_TAXONOMY),
+    "fault_side": FAULT_SIDES,
+    "source": SOURCES,
+    "mark": MARKS,
+}
 
 
 def _now_iso() -> str:
@@ -77,7 +139,7 @@ class Event:
     outro invalida a cadeia inteira.
     """
 
-    event: str                 # "start" | "attempt" | "verify" | "end"
+    event: str                 # "start" | "attempt" | "verify" | "end" | "annotate" | "install"
     trajectory_id: str         # chave comum a toda a trajetória
     seq: int                   # ordem dentro da trajetória, começa em 0
     ts: str = field(default_factory=_now_iso)
@@ -104,10 +166,23 @@ class Event:
     verdict: str | None = None          # "pass" | "fail" | "absent"
     evidence: str | None = None         # trecho da saída do hook, truncado
 
-    # diagnóstico
+    # diagnóstico (vocabulário fechado — ver CAUSE_TAXONOMY e FAULT_SIDES)
     cause_category: str | None = None   # "epistemica" | "competencia" | "ambiente"
-    cause_subtype: str | None = None
+    cause_subtype: str | None = None    # só válido dentro da sua categoria
     fault_side: str | None = None       # "modelo" | "infraestrutura"
+
+    # atribuição de fonte: `source` diz que peça do harness produziu o efeito,
+    # `source_ref` diz qual instância dela. É o par que permite sair de "veio de
+    # hook" e chegar a "veio do hook pytest" — sozinho, nenhum dos dois responde.
+    source: str | None = None           # vocabulário fechado (SOURCES)
+    source_ref: str | None = None       # identificador concreto, texto livre
+
+    # annotate: marco retrospectivo sobre um evento já gravado
+    mark: str | None = None             # "t_err" | "t_lock" | "t_obs"
+    target_seq: int | None = None       # `seq` do evento marcado, mesma trajetória
+
+    # install: como desfazer o que foi instalado
+    inverse: str | None = None          # comando ou JSON; formato é de outra fatia
 
     # end
     outcome: str | None = None          # "ok" | "failed" | "abandoned"
@@ -117,6 +192,47 @@ class Event:
     # integridade
     prev_hash: str | None = None
     hash: str = ""
+
+    def __post_init__(self) -> None:
+        """Rejeita vocabulário inválido na construção, antes de qualquer escrita.
+
+        Aqui — e não em `write()` — porque quem preenche estes campos é o código
+        do FPCH, não o usuário: um valor fora do vocabulário é defeito de
+        programação, e defeito de programação deve estourar onde foi cometido. Se
+        escapasse para o disco, a linha continuaria legível e o agregado perderia
+        a categoria em silêncio, que é o modo de falha que a trilha existe para
+        eliminar. `write()` segue sem `raise`: perder a chamada por causa do log
+        continua sendo pior do que perder o log.
+        """
+        for campo, aceitos in _CLOSED_VOCAB.items():
+            valor = getattr(self, campo)
+            if valor is not None and valor not in aceitos:
+                raise ValueError(
+                    f"{campo} inválido: {valor!r}. Aceitos: {', '.join(aceitos)}."
+                )
+
+        if self.cause_subtype is not None:
+            if self.cause_category is None:
+                raise ValueError(
+                    f"cause_subtype={self.cause_subtype!r} sem cause_category. "
+                    "O subtipo só existe dentro de uma categoria; sozinho ele não "
+                    f"diz nada. Categorias: {', '.join(CAUSE_TAXONOMY)}."
+                )
+            aceitos = CAUSE_TAXONOMY[self.cause_category]
+            if self.cause_subtype not in aceitos:
+                raise ValueError(
+                    f"cause_subtype inválido para cause_category="
+                    f"{self.cause_category!r}: {self.cause_subtype!r}. "
+                    f"Aceitos nesta categoria: {', '.join(aceitos)}."
+                )
+
+        if self.event == "install" and not self.inverse:
+            raise ValueError(
+                "evento install sem inverse. Instalar sem registrar como "
+                "desinstalar é exatamente o que o requisito de reversibilidade "
+                "proíbe: o rollback exato precisa da inversa gravada no momento "
+                "da ação, não reconstruída depois."
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -133,6 +249,15 @@ _warned_write = False
 #: corrupção justamente do relatório que deveria denunciá-la.
 _corrupt_lines = 0
 _warned_corrupt = False
+
+#: Valores de vocabulário fechado lidos do disco que não pertencem ao vocabulário
+#: vigente. Não é erro: a trilha é append-only e o esquema 3 sucede dois outros,
+#: então linha antiga com rótulo antigo é o esperado. É contado pelo mesmo motivo
+#: que `corrupt_lines` — o que não se entende é contado, não descartado em
+#: silêncio. Conta *ocorrências de campo*: uma linha com categoria e fonte
+#: desconhecidas soma dois.
+_unknown_vocab = 0
+_warned_vocab = False
 
 #: Ponta da cadeia por arquivo, para não reler o arquivo inteiro a cada escrita.
 _tip_cache: dict[str, str | None] = {}
@@ -161,16 +286,23 @@ def next_seq(trajectory_id: str) -> int:
 
 def counters() -> dict:
     """Contadores observáveis do processo. Zero significa trilha íntegra."""
-    return {"write_failures": _write_failures, "corrupt_lines": _corrupt_lines}
+    return {
+        "write_failures": _write_failures,
+        "corrupt_lines": _corrupt_lines,
+        "unknown_vocab": _unknown_vocab,
+    }
 
 
 def reset_state() -> None:
     """Zera contadores, avisos e cache de cadeia. Existe para os testes."""
     global _write_failures, _warned_write, _corrupt_lines, _warned_corrupt
+    global _unknown_vocab, _warned_vocab
     _write_failures = 0
     _warned_write = False
     _corrupt_lines = 0
     _warned_corrupt = False
+    _unknown_vocab = 0
+    _warned_vocab = False
     _tip_cache.clear()
     _seq_counters.clear()
 
@@ -324,13 +456,53 @@ def _normalize(row: dict, index: int) -> dict:
     return up
 
 
+def _unknown_fields(row: dict) -> int:
+    """Quantos campos de vocabulário fechado desta linha estão fora do vocabulário.
+
+    Só se aplica à leitura. Na escrita o mesmo caso é `ValueError`; aqui não pode
+    ser, porque a linha já está no disco e condená-la não a conserta — o que
+    resta é contá-la e agregá-la sob `"?"`, para que ninguém leia um agregado
+    incompleto como se fosse completo.
+    """
+    fora = 0
+    for campo, aceitos in _CLOSED_VOCAB.items():
+        valor = row.get(campo)
+        if valor is not None and valor not in aceitos:
+            fora += 1
+    subtipo = row.get("cause_subtype")
+    if subtipo is not None:
+        categoria = row.get("cause_category")
+        if categoria not in CAUSE_TAXONOMY or subtipo not in CAUSE_TAXONOMY[categoria]:
+            fora += 1
+    return fora
+
+
+def _cause_keys(row: dict) -> tuple[str, str | None] | None:
+    """Chaves de agregação de causa desta linha, ou `None` se ela não diagnostica.
+
+    Fora do vocabulário vigente vira `"?"` em vez de sumir: o balde do
+    desconhecido é o que impede que uma soma parcial se apresente como total.
+    """
+    categoria = row.get("cause_category")
+    subtipo = row.get("cause_subtype")
+    if categoria is None and subtipo is None:
+        return None
+    if categoria in CAUSE_TAXONOMY:
+        chave = str(categoria)
+        if subtipo is None:
+            return chave, None
+        return chave, (str(subtipo) if subtipo in CAUSE_TAXONOMY[chave] else "?")
+    return "?", ("?" if subtipo is not None else None)
+
+
 def _read_raw(target: Path) -> tuple[list[dict], int]:
     """Linhas na ordem do arquivo, normalizadas, mais a contagem de corrompidas."""
-    global _corrupt_lines, _warned_corrupt
+    global _corrupt_lines, _warned_corrupt, _unknown_vocab, _warned_vocab
     if not target.exists():
         return [], 0
     rows: list[dict] = []
     bad = 0
+    estranhos = 0
     with target.open(encoding="utf-8") as fh:
         for index, line in enumerate(fh):
             line = line.strip()
@@ -344,7 +516,19 @@ def _read_raw(target: Path) -> tuple[list[dict], int]:
             if not isinstance(parsed, dict):
                 bad += 1
                 continue
-            rows.append(_normalize(parsed, index))
+            row = _normalize(parsed, index)
+            estranhos += _unknown_fields(row)
+            rows.append(row)
+    if estranhos:
+        _unknown_vocab += estranhos
+        if not _warned_vocab:
+            _warned_vocab = True
+            print(
+                f"fpch: AVISO — {estranhos} valor(es) fora do vocabulário vigente na "
+                f"trilha {target}. Foram agregados sob '?', não descartados: um "
+                "agregado que perde categorias em silêncio mente por omissão.",
+                file=sys.stderr,
+            )
     if bad:
         _corrupt_lines += bad
         if not _warned_corrupt:
@@ -418,6 +602,73 @@ def verify_chain(path: Path | None = None) -> tuple[bool, int | None]:
 
 
 # ---------------------------------------------------------------------------
+# Processo de falha
+# ---------------------------------------------------------------------------
+
+def failure_process(path: Path | None = None) -> dict:
+    """Marcos do processo de falha por trajetória, com as duas derivadas.
+
+    Devolve, para cada trajetória que tenha ao menos um evento `annotate`::
+
+        {"t_err": seq|None, "t_lock": seq|None, "t_obs": seq|None,
+         "fix_window": int|None, "observability_lag": int|None,
+         "remarcado": bool}
+
+    `fix_window = t_lock − t_err` é o quanto de trajetória ainda havia entre o
+    erro decisivo e o ponto de não-retorno; `observability_lag = t_obs − t_lock`
+    é o quanto o sistema levou para *mostrar* o erro depois que já era tarde.
+    Marco não anotado devolve `None` em vez de zero — ausência de anotação não é
+    janela nula, e confundir as duas coisas inventaria dado.
+
+    O marco é retrospectivo: só se sabe qual erro foi decisivo olhando a
+    trajetória inteira, depois do desfecho. Como a trilha é append-only, marcar
+    não reescreve o evento marcado — grava um evento `annotate` novo, que entra na
+    cadeia de hash como qualquer outro. Anotar é, ele próprio, auditável: ninguém
+    marca retroativamente sem deixar rastro. Marco anotado duas vezes na mesma
+    trajetória vale pelo último, e a trajetória vem com `remarcado: True` — mudar
+    de opinião sobre um rótulo retrospectivo é legítimo, escondê-lo não é.
+
+    **Limite de granularidade.** As derivadas são medidas **em eventos da
+    trilha**, não em turnos internos do agente. Zhao et al. (2026) medem passos de
+    raciocínio-e-ação dentro de uma execução; o FPCH registra uma linha por
+    chamada de backend. A adoção aqui é da **estrutura conceitual** — três marcos
+    e duas derivadas —, não da unidade de medida. Comparar os números produzidos
+    por esta função com os números do artigo seria erro de leitura.
+    """
+    resultado: dict[str, dict] = {}
+    for tid, eventos in trajectories(path).items():
+        marcos: dict[str, int] = {}
+        remarcado = False
+        anotada = False
+        for ev in eventos:
+            if ev.get("event") != "annotate":
+                continue
+            anotada = True
+            marca = ev.get("mark")
+            alvo = ev.get("target_seq")
+            if marca not in MARKS or alvo is None:
+                continue  # anotação ilegível como marco: contada em unknown_vocab
+            if marca in marcos:
+                remarcado = True
+            marcos[str(marca)] = int(alvo)
+        if not anotada:
+            continue
+
+        t_err = marcos.get("t_err")
+        t_lock = marcos.get("t_lock")
+        t_obs = marcos.get("t_obs")
+        resultado[tid] = {
+            "t_err": t_err,
+            "t_lock": t_lock,
+            "t_obs": t_obs,
+            "fix_window": None if t_err is None or t_lock is None else t_lock - t_err,
+            "observability_lag": None if t_lock is None or t_obs is None else t_obs - t_lock,
+            "remarcado": remarcado,
+        }
+    return resultado
+
+
+# ---------------------------------------------------------------------------
 # Agregação
 # ---------------------------------------------------------------------------
 
@@ -433,6 +684,12 @@ def summary(path: Path | None = None) -> dict:
 
     by_pool: dict[str, dict] = {}
     detail: dict[str, dict] = {}
+    # Causa e fonte são contadas sobre *todos* os eventos que carregam o campo,
+    # não só sobre `attempt`: quem diagnostica no FPCH é o hook (evento `verify`),
+    # e restringir a agregação a `attempt` zeraria justamente a coluna que
+    # interessa.
+    by_cause: dict[str, dict] = {}
+    by_source: dict[str, dict] = {}
 
     for r in rows:
         tid = str(r.get("trajectory_id") or "?")
@@ -451,6 +708,23 @@ def summary(path: Path | None = None) -> dict:
             traj["task_class"] = r.get("task_class")
         if traj["label"] is None:
             traj["label"] = r.get("label")
+
+        chaves = _cause_keys(r)
+        if chaves is not None:
+            categoria, subtipo = chaves
+            balde = by_cause.setdefault(categoria, {"total": 0, "subtypes": {}})
+            balde["total"] += 1
+            if subtipo is not None:
+                balde["subtypes"][subtipo] = balde["subtypes"].get(subtipo, 0) + 1
+
+        origem = r.get("source")
+        if origem is not None:
+            chave = str(origem) if origem in SOURCES else "?"
+            balde = by_source.setdefault(chave, {"total": 0, "refs": {}})
+            balde["total"] += 1
+            ref = r.get("source_ref")
+            if ref is not None:
+                balde["refs"][str(ref)] = balde["refs"].get(str(ref), 0) + 1
 
         kind = r.get("event")
         if kind == "attempt":
@@ -497,6 +771,8 @@ def summary(path: Path | None = None) -> dict:
         "total_calls": sum(1 for r in rows if r.get("event") == "attempt"),
         "total_events": len(rows),
         "by_pool": by_pool,
+        "by_cause": by_cause,
+        "by_source": by_source,
         "trajectories": {
             "total": total,
             "by_outcome": by_outcome,

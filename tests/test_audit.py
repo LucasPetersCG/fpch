@@ -324,3 +324,430 @@ def test_summary_de_trilha_vazia(tmp_path):
     assert s["total_calls"] == 0
     assert s["trajectories"]["total"] == 0
     assert s["by_pool"] == {}
+    assert s["by_cause"] == {}
+    assert s["by_source"] == {}
+
+
+# --------------------------------------------------------------------------
+# Vocabulário fechado — validação na construção
+#
+# Metade destes casos existe para provar que o verificador **não acusa o
+# inocente**: para cada rejeição há o par que mostra o caso legítimo vizinho
+# passando. Uma suíte só de casos positivos não distingue "valida" de "recusa
+# tudo".
+# --------------------------------------------------------------------------
+
+@pytest.mark.parametrize("categoria", sorted(audit.CAUSE_TAXONOMY))
+def test_toda_categoria_da_taxonomia_e_aceita(categoria):
+    ev = _evento(0, event="verify", cause_category=categoria)
+    assert ev.cause_category == categoria
+
+
+@pytest.mark.parametrize("categoria,subtipo", [
+    (cat, sub) for cat, subs in audit.CAUSE_TAXONOMY.items() for sub in subs
+])
+def test_todo_subtipo_e_aceito_na_sua_categoria(categoria, subtipo):
+    ev = _evento(0, event="verify", cause_category=categoria, cause_subtype=subtipo)
+    assert (ev.cause_category, ev.cause_subtype) == (categoria, subtipo)
+
+
+def test_categoria_invalida_levanta_com_o_valor_na_mensagem():
+    with pytest.raises(ValueError) as exc:
+        _evento(0, cause_category="epistêmica")   # acento: erro de digitação plausível
+    msg = str(exc.value)
+    assert "epistêmica" in msg          # diz o que recebeu
+    assert "epistemica" in msg          # e o que aceitaria
+
+
+def test_subtipo_na_categoria_errada_levanta():
+    with pytest.raises(ValueError) as exc:
+        _evento(0, cause_category="ambiente", cause_subtype="premissa_falsa")
+    msg = str(exc.value)
+    assert "premissa_falsa" in msg
+    assert "bloqueio_de_ambiente" in msg
+
+
+def test_subtipo_sem_categoria_levanta():
+    with pytest.raises(ValueError) as exc:
+        _evento(0, cause_subtype="premissa_falsa")
+    assert "cause_category" in str(exc.value)
+
+
+def test_categoria_sem_subtipo_e_legitima():
+    """Os hooks gravam só a categoria quando não há base para o subtipo."""
+    ev = _evento(0, event="verify", cause_category="ambiente")
+    assert ev.cause_subtype is None
+
+
+@pytest.mark.parametrize("lado", audit.FAULT_SIDES)
+def test_fault_side_valido_e_aceito(lado):
+    assert _evento(0, fault_side=lado).fault_side == lado
+
+
+def test_fault_side_invalido_levanta():
+    with pytest.raises(ValueError) as exc:
+        _evento(0, fault_side="infra")
+    assert "infra" in str(exc.value)
+
+
+@pytest.mark.parametrize("origem", audit.SOURCES)
+def test_source_valido_e_aceito(origem):
+    ev = _evento(0, source=origem, source_ref="qualquer/coisa")
+    assert (ev.source, ev.source_ref) == (origem, "qualquer/coisa")
+
+
+def test_source_invalido_levanta():
+    with pytest.raises(ValueError) as exc:
+        _evento(0, source="hooks")   # plural: o vocabulário é "hook"
+    assert "hooks" in str(exc.value)
+
+
+def test_source_ref_e_texto_livre():
+    """`source` é fechado; `source_ref` não — é o identificador concreto."""
+    ev = _evento(0, source="mcp", source_ref="servidor-que-ninguem-previu")
+    assert ev.source_ref == "servidor-que-ninguem-previu"
+
+
+@pytest.mark.parametrize("marca", audit.MARKS)
+def test_mark_valido_e_aceito(marca):
+    ev = audit.Event(event="annotate", trajectory_id="t1", seq=1, mark=marca, target_seq=0)
+    assert ev.mark == marca
+
+
+def test_mark_invalido_levanta():
+    with pytest.raises(ValueError) as exc:
+        audit.Event(event="annotate", trajectory_id="t1", seq=1, mark="t_fim", target_seq=0)
+    assert "t_fim" in str(exc.value)
+
+
+def test_evento_sem_diagnostico_nenhum_e_valido():
+    """O caso mais comum da trilha: nada de causa, nada de fonte, nada de marco."""
+    ev = _evento(0, model="m", ok=True)
+    assert (ev.cause_category, ev.source, ev.mark, ev.inverse) == (None, None, None, None)
+
+
+# --------------------------------------------------------------------------
+# Invariante do evento `install`
+# --------------------------------------------------------------------------
+
+def test_install_sem_inverse_levanta():
+    with pytest.raises(ValueError) as exc:
+        audit.Event(event="install", trajectory_id="t1", seq=0, evidence="copiou o hook")
+    assert "inverse" in str(exc.value)
+
+
+def test_install_com_inverse_grava(trilha):
+    ok = audit.write(
+        audit.Event(
+            event="install",
+            trajectory_id="t1",
+            seq=0,
+            source="hook",
+            source_ref="pytest",
+            inverse="rm -f .git/hooks/pre-commit",
+        ),
+        trilha,
+    )
+    assert ok is True
+    row = _linhas(trilha)[0]
+    assert row["inverse"] == "rm -f .git/hooks/pre-commit"
+    assert audit.verify_chain(trilha) == (True, None)
+
+
+def test_inverse_em_evento_que_nao_e_install_nao_e_exigido_nem_proibido(trilha):
+    """A invariante é sobre `install`, não sobre o campo: não acusar o inocente."""
+    assert audit.write(_evento(0, model="m", inverse="git checkout -- ."), trilha) is True
+    assert _linhas(trilha)[0]["inverse"] == "git checkout -- ."
+
+
+# --------------------------------------------------------------------------
+# `write()` mantém o contrato antigo com os campos novos
+# --------------------------------------------------------------------------
+
+def test_write_com_campos_novos_nao_levanta_em_falha_de_io(tmp_path, capsys):
+    alvo = tmp_path / "audit.jsonl"
+    alvo.mkdir()
+    ev = audit.Event(
+        event="install", trajectory_id="t1", seq=0,
+        source="skill", source_ref="fpch-init", inverse="fpch uninstall",
+    )
+    assert audit.write(ev, alvo) is False        # devolve, não levanta
+    assert audit.counters()["write_failures"] == 1
+    assert "AVISO" in capsys.readouterr().err
+
+
+def test_cadeia_integra_com_os_campos_novos(trilha):
+    audit.write(_evento(0, event="start"), trilha)
+    audit.write(
+        _evento(1, event="verify", component="pytest", verdict="fail",
+                cause_category="competencia", cause_subtype="lacuna_de_conhecimento",
+                fault_side="modelo", source="hook", source_ref="pytest"),
+        trilha,
+    )
+    audit.write(
+        audit.Event(event="annotate", trajectory_id="t1", seq=2,
+                    mark="t_err", target_seq=1, evidence="o erro decisivo foi aqui"),
+        trilha,
+    )
+    assert audit.verify_chain(trilha) == (True, None)
+    linhas = _linhas(trilha)
+    for anterior, atual in zip(linhas, linhas[1:]):
+        assert atual["prev_hash"] == anterior["hash"]
+
+
+def test_adulteracao_de_annotate_e_detectada(trilha):
+    """Remarcar escondido é o ataque que o encadeamento tem que pegar."""
+    audit.write(_evento(0, event="start"), trilha)
+    audit.write(
+        audit.Event(event="annotate", trajectory_id="t1", seq=1,
+                    mark="t_err", target_seq=0, evidence="justificativa"),
+        trilha,
+    )
+    audit.write(_evento(2, model="m"), trilha)
+
+    linhas = _linhas(trilha)
+    linhas[1]["target_seq"] = 2          # move o marco sem gravar novo evento
+    trilha.write_text(
+        "\n".join(json.dumps(r, sort_keys=True, ensure_ascii=False) for r in linhas) + "\n",
+        encoding="utf-8",
+    )
+
+    ok, quebrado = audit.verify_chain(trilha)
+    assert ok is False
+    assert quebrado == 1
+
+
+# --------------------------------------------------------------------------
+# Compatibilidade de leitura: esquemas 1 e 2
+# --------------------------------------------------------------------------
+
+def _linha_v2(**kw) -> str:
+    base = {
+        "event": "attempt",
+        "trajectory_id": "t-antiga",
+        "seq": 0,
+        "ts": "2026-08-01T10:00:00.000000-03:00",
+        "schema_version": 2,
+        "task_class": "standard",
+        "backend": "agy",
+        "model": "m",
+        "pool": "agy:google",
+        "prompt_chars": 10,
+        "output_chars": 20,
+        "latency_s": 1.0,
+        "ok": True,
+    }
+    base.update(kw)
+    base["hash"] = audit.compute_hash(base)
+    return json.dumps(base, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
+
+
+def test_linha_de_esquema_2_continua_legivel_e_encadeavel(trilha):
+    trilha.write_text(_linha_v2() + "\n", encoding="utf-8")
+
+    rows = audit.read_all(trilha)
+    assert len(rows) == 1
+    assert rows[0]["schema_version"] == 2
+    assert audit.verify_chain(trilha) == (True, None)
+    assert audit.counters()["unknown_vocab"] == 0
+
+    # E o esquema 3 continua a cadeia a partir dela, sem reescrever nada.
+    audit.write(_evento(1, tid="t-antiga", model="novo"), trilha)
+    linhas = _linhas(trilha)
+    assert linhas[0]["schema_version"] == 2
+    assert linhas[1]["schema_version"] == audit.SCHEMA_VERSION == 3
+    assert linhas[1]["prev_hash"] == linhas[0]["hash"]
+    assert audit.verify_chain(trilha) == (True, None)
+
+
+def test_esquemas_1_2_e_3_convivem_na_mesma_trilha(trilha):
+    trilha.write_text(_linha_v1(label="antigo") + "\n" + _linha_v2() + "\n", encoding="utf-8")
+    audit.write(_evento(0, tid="nova", model="m"), trilha)
+
+    rows = audit.read_all(trilha)
+    assert {r["schema_version"] for r in rows} == {1, 2, 3}
+    assert audit.verify_chain(trilha) == (True, None)
+    assert audit.summary(trilha)["total_calls"] == 3
+
+
+# --------------------------------------------------------------------------
+# Vocabulário desconhecido vindo do disco
+# --------------------------------------------------------------------------
+
+def test_vocabulario_desconhecido_do_disco_cai_em_interrogacao(trilha, capsys):
+    trilha.write_text(
+        _linha_v2(cause_category="ambiental", cause_subtype="sei_la", source="plugin") + "\n",
+        encoding="utf-8",
+    )
+
+    rows = audit.read_all(trilha)          # não levanta: a linha já está no disco
+    assert len(rows) == 1
+    # três campos fora do vocabulário na mesma linha: categoria, subtipo e fonte
+    assert audit.counters()["unknown_vocab"] == 3
+    assert "AVISO" in capsys.readouterr().err
+
+    s = audit.summary(trilha)
+    assert s["by_cause"]["?"]["total"] == 1
+    assert s["by_cause"]["?"]["subtypes"] == {"?": 1}
+    assert s["by_source"]["?"]["total"] == 1
+
+
+def test_vocabulario_vigente_do_disco_nao_conta_como_desconhecido(trilha, capsys):
+    """O par que prova que o contador não acusa o inocente."""
+    trilha.write_text(
+        _linha_v2(cause_category="ambiente", cause_subtype="bloqueio_de_ambiente",
+                  fault_side="infraestrutura", source="hook", source_ref="pytest") + "\n",
+        encoding="utf-8",
+    )
+
+    audit.read_all(trilha)
+    assert audit.counters()["unknown_vocab"] == 0
+    assert capsys.readouterr().err == ""
+
+    s = audit.summary(trilha)
+    assert "?" not in s["by_cause"]
+    assert s["by_cause"]["ambiente"]["subtypes"] == {"bloqueio_de_ambiente": 1}
+
+
+def test_subtipo_desconhecido_sob_categoria_conhecida_vira_interrogacao(trilha):
+    trilha.write_text(
+        _linha_v2(cause_category="ambiente", cause_subtype="bloqueio_de_rede") + "\n",
+        encoding="utf-8",
+    )
+    s = audit.summary(trilha)
+    # A categoria é boa e é preservada; só o subtipo cai no balde do desconhecido.
+    assert s["by_cause"]["ambiente"]["total"] == 1
+    assert s["by_cause"]["ambiente"]["subtypes"] == {"?": 1}
+    assert audit.counters()["unknown_vocab"] == 1
+
+
+# --------------------------------------------------------------------------
+# Processo de falha
+# --------------------------------------------------------------------------
+
+def _anota(path, tid, seq, marca, alvo):
+    audit.write(
+        audit.Event(event="annotate", trajectory_id=tid, seq=seq,
+                    mark=marca, target_seq=alvo, evidence=f"marco {marca}"),
+        path,
+    )
+
+
+def test_failure_process_calcula_as_duas_derivadas(trilha):
+    for i in range(7):
+        audit.write(_evento(i, tid="t1", model=f"m{i}"), trilha)
+    _anota(trilha, "t1", 7, "t_err", 1)
+    _anota(trilha, "t1", 8, "t_lock", 4)
+    _anota(trilha, "t1", 9, "t_obs", 6)
+
+    fp = audit.failure_process(trilha)["t1"]
+    assert (fp["t_err"], fp["t_lock"], fp["t_obs"]) == (1, 4, 6)
+    assert fp["fix_window"] == 3
+    assert fp["observability_lag"] == 2
+    assert fp["remarcado"] is False
+    # Anotar não reescreveu nada: a cadeia segue íntegra e as anotações estão nela.
+    assert audit.verify_chain(trilha) == (True, None)
+
+
+def test_failure_process_devolve_none_para_marco_ausente(trilha):
+    audit.write(_evento(0, tid="t1", model="m"), trilha)
+    _anota(trilha, "t1", 1, "t_err", 0)
+
+    fp = audit.failure_process(trilha)["t1"]
+    assert fp["t_err"] == 0
+    assert fp["t_lock"] is None and fp["t_obs"] is None
+    # Ausência de marco não é janela zero: `None` é a resposta honesta.
+    assert fp["fix_window"] is None
+    assert fp["observability_lag"] is None
+
+
+def test_failure_process_reporta_remarcacao_e_vale_o_ultimo(trilha):
+    for i in range(5):
+        audit.write(_evento(i, tid="t1", model=f"m{i}"), trilha)
+    _anota(trilha, "t1", 5, "t_err", 1)
+    _anota(trilha, "t1", 6, "t_lock", 4)
+    _anota(trilha, "t1", 7, "t_err", 3)      # mudou de opinião, e isso aparece
+
+    fp = audit.failure_process(trilha)["t1"]
+    assert fp["t_err"] == 3
+    assert fp["fix_window"] == 1
+    assert fp["remarcado"] is True
+
+
+def test_failure_process_ignora_trajetoria_sem_anotacao(trilha):
+    _trajetoria(trilha, "sem_marco", tentativas=2, outcome="failed")
+    audit.write(_evento(0, tid="com_marco", event="start"), trilha)
+    _anota(trilha, "com_marco", 1, "t_err", 0)
+
+    fp = audit.failure_process(trilha)
+    assert set(fp) == {"com_marco"}
+
+
+def test_failure_process_de_trilha_vazia(tmp_path):
+    assert audit.failure_process(tmp_path / "vazio.jsonl") == {}
+
+
+def test_failure_process_separa_trajetorias(trilha):
+    for tid, err, lock in (("t1", 0, 2), ("t2", 1, 5)):
+        audit.write(_evento(0, tid=tid, event="start"), trilha)
+        _anota(trilha, tid, 10, "t_err", err)
+        _anota(trilha, tid, 11, "t_lock", lock)
+
+    fp = audit.failure_process(trilha)
+    assert fp["t1"]["fix_window"] == 2
+    assert fp["t2"]["fix_window"] == 4
+
+
+# --------------------------------------------------------------------------
+# Agregação por causa e por fonte
+# --------------------------------------------------------------------------
+
+def test_summary_agrega_por_causa_incluindo_o_balde_desconhecido(trilha):
+    audit.write(_evento(0, event="verify", cause_category="epistemica",
+                        cause_subtype="premissa_falsa"), trilha)
+    audit.write(_evento(1, event="verify", cause_category="epistemica",
+                        cause_subtype="premissa_falsa"), trilha)
+    audit.write(_evento(2, event="verify", cause_category="epistemica"), trilha)
+    audit.write(_evento(3, event="verify", cause_category="ambiente",
+                        cause_subtype="bloqueio_de_ambiente"), trilha)
+    with trilha.open("a", encoding="utf-8") as fh:
+        fh.write(_linha_v2(cause_category="chute_do_passado") + "\n")
+
+    by_cause = audit.summary(trilha)["by_cause"]
+    assert by_cause["epistemica"]["total"] == 3
+    assert by_cause["epistemica"]["subtypes"] == {"premissa_falsa": 2}
+    assert by_cause["ambiente"] == {"total": 1, "subtypes": {"bloqueio_de_ambiente": 1}}
+    assert by_cause["?"]["total"] == 1
+
+
+def test_summary_agrega_por_fonte_com_referencia_concreta(trilha):
+    audit.write(_evento(0, event="verify", source="hook", source_ref="pytest"), trilha)
+    audit.write(_evento(1, event="verify", source="hook", source_ref="pytest"), trilha)
+    audit.write(_evento(2, event="verify", source="hook", source_ref="ruff"), trilha)
+    audit.write(_evento(3, event="verify", source="mcp"), trilha)
+
+    by_source = audit.summary(trilha)["by_source"]
+    assert by_source["hook"]["total"] == 3
+    assert by_source["hook"]["refs"] == {"pytest": 2, "ruff": 1}
+    # Fonte sem referência conta na fonte e não inventa uma referência.
+    assert by_source["mcp"] == {"total": 1, "refs": {}}
+
+
+def test_summary_conta_causa_fora_de_attempt(trilha):
+    """Quem diagnostica é o hook (`verify`); contar só `attempt` zeraria a coluna."""
+    _trajetoria(trilha, "t1", tentativas=1, outcome="failed")
+    audit.write(_evento(9, tid="t1", event="verify", component="pytest", verdict="fail",
+                        cause_category="ambiente", cause_subtype="bloqueio_de_ambiente",
+                        source="hook", source_ref="pytest"), trilha)
+
+    s = audit.summary(trilha)
+    assert s["total_calls"] == 1                      # nada mudou no contrato antigo
+    assert s["by_cause"]["ambiente"]["total"] == 1
+    assert s["by_source"]["hook"]["refs"] == {"pytest": 1}
+
+
+def test_summary_sem_causa_nem_fonte_nao_inventa_baldes(trilha):
+    _trajetoria(trilha, "t1", tentativas=2, outcome="ok")
+    s = audit.summary(trilha)
+    assert s["by_cause"] == {}
+    assert s["by_source"] == {}

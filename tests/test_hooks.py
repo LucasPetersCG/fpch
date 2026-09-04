@@ -165,6 +165,110 @@ def test_timeout_tambem_nao_vira_pass_com_saida_vazia(trilha):
 
 
 # ---------------------------------------------------------------------------
+# 4b. Vocabulário fechado (C14 onda 2A): subtipo, source/source_ref, e prova de
+# que o evento legítimo não é rejeitado por `Event.__post_init__` (audit.py).
+# ---------------------------------------------------------------------------
+
+def test_timeout_emite_subtipo_bloqueio_de_ambiente(trilha):
+    h = _hook(cmd=_py("import time; time.sleep(5)"), criterio="exit_zero")
+    r = hooks.run_hook(h, timeout_s=0.2, audit_path=trilha)
+    assert r.cause_category == "ambiente"
+    assert r.cause_subtype == "bloqueio_de_ambiente"
+
+
+def test_comando_inexistente_emite_subtipo_bloqueio_de_ambiente(trilha):
+    h = _hook(cmd=["fpch-binario-que-nao-existe-8f3a2c"], criterio="exit_zero")
+    r = hooks.run_hook(h, audit_path=trilha)
+    assert r.cause_category == "ambiente"
+    assert r.cause_subtype == "bloqueio_de_ambiente"
+
+
+def test_recusa_generica_do_so_e_ambiente_com_subtipo_residual(trilha, monkeypatch):
+    """O terceiro caso de `_executa` (PermissionError/NotADirectoryError/OSError
+    genérico) tem categoria determinada e subtipo residual.
+
+    O processo não chegou a rodar, então a falha nasceu fora do que o hook
+    deveria julgar — que é a definição de `"ambiente"`. O que não se sabe é o
+    subtipo, e para isso a taxonomia adotada tem o slot `"outro"`. Deixar a
+    categoria vazia aqui faria a falha sumir do agregado por causa, que é o
+    sumiço silencioso que o vocabulário fechado existe para impedir."""
+    def _recusa(*a, **k):
+        raise PermissionError("acesso negado, simulado")
+
+    monkeypatch.setattr(hooks.subprocess, "run", _recusa)
+    h = _hook(cmd=_py("import sys; sys.exit(0)"), criterio="exit_zero")
+    r = hooks.run_hook(h, audit_path=trilha)
+
+    assert r.verdict == "fail"
+    assert r.cause_category == "ambiente"
+    assert r.cause_subtype == "outro"
+    assert len(_linhas(trilha)) == 1
+    assert _linhas(trilha)[-1]["cause_subtype"] == "outro"
+
+
+def test_reprovacao_de_hook_que_rodou_continua_sem_categoria(trilha):
+    """O par que delimita o teste acima: categoria indeterminada segue vazia.
+
+    Um hook que **executou** e reprovou não diz, por si, se a causa foi
+    epistêmica ou de competência. Aqui a categoria é desconhecida, não residual,
+    e preenchê-la seria o rótulo chutado que o módulo recusa — a distinção que
+    `hooks.py` sustenta é entre categoria determinada com subtipo residual e
+    categoria indeterminada, não entre casos conhecidos e o resto."""
+    h = _hook(cmd=_py("import sys; sys.exit(1)"), criterio="exit_zero")
+    r = hooks.run_hook(h, audit_path=trilha)
+
+    assert r.verdict == "fail"
+    assert r.cause_category is None
+    assert r.cause_subtype is None
+    assert r.fault_side == "infraestrutura"
+
+
+def test_source_e_source_ref_chegam_a_trilha_com_o_nome_real_do_hook(trilha):
+    h = _hook(nome="meu-hook-xyz", cmd=_py("import sys; sys.exit(0)"), criterio="exit_zero")
+    hooks.run_hook(h, audit_path=trilha)
+
+    registro = _linhas(trilha)[-1]
+    assert registro["source"] == "hook"
+    assert registro["source_ref"] == "meu-hook-xyz"
+
+
+def test_source_e_source_ref_chegam_a_trilha_tambem_numa_reprovacao(trilha):
+    """Par positivo: `source`/`source_ref` não dependem do veredito ser `pass` —
+    uma reprovação também sabe de que hook concreto ela veio."""
+    h = _hook(nome="outro-hook", cmd=_py("import sys; sys.exit(1)"), criterio="exit_zero")
+    hooks.run_hook(h, audit_path=trilha)
+
+    registro = _linhas(trilha)[-1]
+    assert registro["verdict"] == "fail"
+    assert registro["source"] == "hook"
+    assert registro["source_ref"] == "outro-hook"
+
+
+def test_evento_de_timeout_e_gravado_na_trilha_sem_ser_rejeitado(trilha):
+    """Par positivo de `test_timeout_emite_subtipo_bloqueio_de_ambiente`: o par
+    `cause_category='ambiente'` + `cause_subtype='bloqueio_de_ambiente'` que
+    `run_hook` monta é vocabulário legítimo — `Event.__post_init__` (audit.py)
+    aceita e a linha chega ao disco intacta, não é descartada em silêncio."""
+    h = _hook(cmd=_py("import time; time.sleep(5)"), criterio="exit_zero")
+    hooks.run_hook(h, timeout_s=0.2, audit_path=trilha)
+
+    registro = _linhas(trilha)[-1]
+    assert registro["cause_category"] == "ambiente"
+    assert registro["cause_subtype"] == "bloqueio_de_ambiente"
+    assert registro["fault_side"] == "infraestrutura"
+
+
+def test_evento_de_binario_ausente_e_gravado_na_trilha_sem_ser_rejeitado(trilha):
+    """Par positivo de `test_comando_inexistente_emite_subtipo_bloqueio_de_ambiente`."""
+    h = _hook(cmd=["fpch-binario-que-nao-existe-8f3a2c"], criterio="exit_zero")
+    hooks.run_hook(h, audit_path=trilha)
+
+    registro = _linhas(trilha)[-1]
+    assert registro["cause_category"] == "ambiente"
+    assert registro["cause_subtype"] == "bloqueio_de_ambiente"
+
+
+# ---------------------------------------------------------------------------
 # 5. evidence truncada em EVIDENCE_MAX (500) caracteres.
 # ---------------------------------------------------------------------------
 

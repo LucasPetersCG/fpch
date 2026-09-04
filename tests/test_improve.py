@@ -86,6 +86,27 @@ def _linhas(path) -> list[dict]:
     return [json.loads(ln) for ln in path.read_text(encoding="utf-8").splitlines() if ln.strip()]
 
 
+def _trilha_manual(trilha, eventos: list[dict]) -> None:
+    """Grava eventos direto no arquivo, encadeados, sem passar por `Event.__post_init__`.
+
+    Existe só para simular uma trilha antiga: `Event` recusaria construir um
+    evento com vocabulário fora do vigente, mas uma linha assim pode legitimamente
+    existir em disco — a trilha é append-only e o esquema evolui. `compute_hash`
+    é o mesmo usado por `audit.write`, então a cadeia resultante confere em
+    `audit.verify_chain` como qualquer outra.
+    """
+    linhas = []
+    prev: str | None = None
+    for ev in eventos:
+        payload = {k: v for k, v in ev.items() if v is not None}
+        if prev is not None:
+            payload["prev_hash"] = prev
+        payload["hash"] = audit.compute_hash(payload)
+        prev = payload["hash"]
+        linhas.append(json.dumps(payload, sort_keys=True, ensure_ascii=False, separators=(",", ":")))
+    trilha.write_text("\n".join(linhas) + "\n", encoding="utf-8")
+
+
 def _politica(tmp_path, corpo: str):
     caminho = tmp_path / "fpch.policy.toml"
     caminho.write_text(corpo, encoding="utf-8")
@@ -567,3 +588,143 @@ def test_cli_apply_aplica_a_proposta(trilha, propostas, tmp_path, capsys):
 
     assert code == 0
     assert policy_mod.load(caminho).backends.timeout_s == 1200
+
+
+# ---------------------------------------------------------------------------
+# 8. `source`/`source_ref` (C14 onda 2A) e tolerância a vocabulário desconhecido
+# ---------------------------------------------------------------------------
+
+def test_recusa_com_regra_identificada_grava_source_politica(pol, trilha, propostas, tmp_path):
+    """RECUSA_SEM_MUDANCA nasce depois de `_casa_regra` já ter identificado uma
+    `Regra` — é o caso em que a fonte É determinável, e por isso o evento gravado
+    carrega `source='politica'` com `source_ref` igual ao nome concreto da regra."""
+    caminho = _politica(tmp_path, f"[backends]\ntimeout_s = {improve.TETO_TIMEOUT_S}\n")
+    pol = policy_mod.load(caminho)
+    _verify(trilha)
+
+    an = improve.propor(pol, trilha=trilha, propostas_dir=propostas)
+
+    assert an.proposta is None
+    assert an.recusas[0].codigo == improve.RECUSA_SEM_MUDANCA
+    assert an.recusas[0].regra == improve.REGRA_TIMEOUT.nome
+    registro = _linhas(trilha)[-1]
+    assert registro["source"] == "politica"
+    assert registro["source_ref"] == improve.REGRA_TIMEOUT.nome
+
+
+def test_recusa_sem_regra_identificada_nao_grava_source(pol, trilha, propostas):
+    """Par positivo do teste acima: quando nenhuma `Regra` chegou a ser identificada
+    (aqui, condição (b) barra antes da condição (c)), `source`/`source_ref` ficam
+    de fora do evento — campo vazio é honesto, chute não é."""
+    _verify(trilha, fault_side="modelo")
+
+    an = improve.propor(pol, trilha=trilha, propostas_dir=propostas)
+
+    assert an.proposta is None
+    assert an.recusas[0].codigo == improve.RECUSA_LADO_MODELO
+    assert an.recusas[0].regra is None
+    registro = _linhas(trilha)[-1]
+    assert "source" not in registro
+    assert "source_ref" not in registro
+
+
+def test_apply_bem_sucedido_grava_source_politica_com_regra_e_arquivo(trilha, propostas, tmp_path):
+    """A aplicação efetiva é o caso mais concreto: a mudança nasceu de uma regra de
+    política e foi escrita num arquivo nomeado — os dois identificadores que
+    `source_ref` pode carregar."""
+    caminho = _politica(tmp_path, "[backends]\ntimeout_s = 600\n")
+    pol = policy_mod.load(caminho)
+    _verify(trilha)
+    an = improve.propor(pol, trilha=trilha, propostas_dir=propostas)
+
+    res = improve.aplicar(an.proposta.id, policy_path=caminho, trilha=trilha,
+                          propostas_dir=propostas)
+
+    assert res.ok, res.recusa
+    registro = _linhas(trilha)[-1]
+    assert registro["source"] == "politica"
+    assert improve.REGRA_TIMEOUT.nome in registro["source_ref"]
+    assert str(caminho) in registro["source_ref"]
+
+
+def test_apply_recusa_apos_schema_valido_tambem_grava_source_politica(trilha, propostas, tmp_path):
+    """Par positivo, do lado de `aplicar()`: uma recusa que acontece depois do
+    schema da proposta já ter sido conferido também sabe de que regra ela fala —
+    aqui é a mesma proposta forjada de `test_apply_recusa_bloco_imutavel_e_registra`,
+    cujo `regra` é `'ampliar_timeout'`."""
+    caminho = _politica(tmp_path, "[backends]\ntimeout_s = 600\n")
+    _verify(trilha)
+    forjada = {
+        "id": "prop-forjada-2",
+        "criado_em": "2026-08-31T00:00:00.000000-03:00",
+        "trajectory_id": "t1",
+        "component": "pytest",
+        "evidence": "timeout",
+        "regra": "ampliar_timeout",
+        "gatilho": "timeout",
+        "bloco": "padroes_de_contencao",
+        "campo": "sandbox",
+        "valor_atual": "on",
+        "valor_proposto": "off",
+        "justificativa": "…",
+        "remocao": "…",
+        "fault_side": "infraestrutura",
+        "cause_category": None,
+        "schema_version": improve.PROPOSTA_SCHEMA,
+        "status": "proposta",
+        "aplicado_em": None,
+    }
+    propostas.mkdir(parents=True, exist_ok=True)
+    (propostas / "prop-forjada-2.json").write_text(json.dumps(forjada), encoding="utf-8")
+
+    res = improve.aplicar("prop-forjada-2", policy_path=caminho, trilha=trilha,
+                          propostas_dir=propostas)
+
+    assert not res.ok
+    assert res.recusa.codigo == improve.RECUSA_BLOCO_IMUTAVEL
+    registro = _linhas(trilha)[-1]
+    assert registro["source"] == "politica"
+    assert registro["source_ref"] == "ampliar_timeout"
+
+
+def test_apply_recusa_por_id_desconhecido_nao_grava_source(trilha, propostas, tmp_path):
+    """Par negativo do teste acima: sem `dados` (proposta nunca carregada), não há
+    regra a apontar — `source` fica de fora, não chutado."""
+    caminho = _politica(tmp_path, "[backends]\ntimeout_s = 600\n")
+
+    res = improve.aplicar("prop-nao-existe", policy_path=caminho, trilha=trilha,
+                          propostas_dir=propostas)
+
+    assert not res.ok
+    assert res.recusa.regra is None
+    registro = _linhas(trilha)[-1]
+    assert "source" not in registro
+    assert "source_ref" not in registro
+
+
+def test_propor_le_trilha_com_vocabulario_desconhecido_sem_lancar_excecao(pol, trilha, propostas):
+    """O ponto central desta fatia: `Event.__post_init__` valida na ESCRITA, nunca
+    na leitura. Uma linha antiga com `fault_side`/`cause_category` fora do
+    vocabulário vigente (aqui, rótulos que existiam antes da taxonomia fechada)
+    precisa ser lida por `propor()` sem derrubar a análise — só a escrita de um
+    valor novo levanta `ValueError`, e essa linha nunca é reescrita."""
+    _trilha_manual(trilha, [{
+        "event": "verify",
+        "trajectory_id": "legado-1",
+        "seq": 0,
+        "ts": "2020-01-01T00:00:00.000000+00:00",
+        "schema_version": 3,
+        "component": "pytest",
+        "verdict": "fail",
+        "evidence": "exit=None; o hook estourou o timeout de 120s e foi interrompido",
+        "fault_side": "infraestrutura_legada",   # fora de audit.FAULT_SIDES
+        "cause_category": "ambiente_legado",     # fora de audit.CAUSE_TAXONOMY
+    }])
+    audit.reset_state()
+
+    an = improve.propor(pol, trilha=trilha, propostas_dir=propostas)  # não deve lançar
+
+    assert an.proposta is None
+    # fault_side desconhecido não é "infraestrutura": recusado pela condição (b),
+    # não por uma exceção — é essa a diferença entre tolerar e derrubar.
+    assert an.recusas[0].codigo == improve.RECUSA_LADO_MODELO

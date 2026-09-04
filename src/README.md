@@ -2,7 +2,7 @@
 
 > 🧭 **Mapa de docs:** [`AGENTS.md`](../AGENTS.md) · [`docs/PROJECT.md`](../docs/PROJECT.md) · [`docs/STATUS.md`](../docs/STATUS.md) · [`TODO.md`](../TODO.md) · [`docs/analises/camada-multi-modelo.md`](../docs/analises/camada-multi-modelo.md) · [`docs/referencias/estado-da-arte-2026-07.md`](../docs/referencias/estado-da-arte-2026-07.md)
 
-Código do FPCH. Nasceu cobrindo **C1** (camada de acesso multi-modelo) e a ferramenta **cannibalize**; desde a fatia funcional de 01/09/2026 instancia **as cinco camadas do framework** — política (`policy.py`), hooks determinísticos (`hooks.py`), laço de autoaprimoramento (`improve.py`), trilha verificável (`audit.py` + `fpch audit --verify`) e acesso multi-modelo (`router.py`/`backends.py`/`models.py`). **12 arquivos, 4.940 linhas, 235 testes passando** (medido em 02/09/2026).
+Código do FPCH. Nasceu cobrindo **C1** (camada de acesso multi-modelo) e a ferramenta **cannibalize**; desde a fatia funcional de 01/09/2026 instancia **as cinco camadas do framework** — política (`policy.py`), hooks determinísticos (`hooks.py`), laço de autoaprimoramento (`improve.py`), trilha verificável (`audit.py` + `fpch audit --verify`) e acesso multi-modelo (`router.py`/`backends.py`/`models.py`). **12 arquivos, 5.433 linhas, 319 testes passando** (medido em 03/09/2026).
 
 **Status:** funcional e verificado ponta a ponta em 16/07/2026. Stack escolhida nesta sessão (C1 estava aberto): **Python ≥3.11 + uv**. Zero dependências de runtime — só a stdlib e os CLIs oficiais já instalados.
 
@@ -14,6 +14,9 @@ uv run fpch plan hard                 # mostra a cadeia de escalada, sem gastar 
 uv run fpch ask standard "prompt"     # roteia
 uv run fpch ask hard --file spec.md   # prompt longo vem de arquivo
 uv run fpch audit                     # para onde a cota foi
+uv run fpch audit --causes            # falhas agregadas por causa raiz e por fonte
+uv run fpch audit --process           # marcos t_err/t_lock/t_obs por trajetória
+uv run fpch audit --verify            # confere o encadeamento de hashes da trilha
 ```
 
 Canibalizar um artefato de terceiro:
@@ -56,7 +59,17 @@ Essa é a linha real entre uso pretendido e banimento: o ilícito é **mentir so
 
 ## Trilha de auditoria
 
-`~/.fpch/audit.jsonl`, append-only. Serve a três coisas: saber qual pool está drenando; **produzir o dado empírico que o TCC não tem** (lacuna nº 5 do inventário); e reconstruir o que um agente fez, depois do fato.
+`~/.fpch/audit.jsonl`, append-only, encadeada por hash. Serve a três coisas: saber qual pool está drenando; **produzir o dado empírico que o TCC não tem** (lacuna nº 5 do inventário); e reconstruir o que um agente fez, depois do fato.
+
+**Esquema 3 (03/09/2026).** Três acréscimos, cada um respondendo a uma pergunta que a trilha antes não respondia:
+
+- **Causa raiz com vocabulário fechado** — 3 categorias e 9 subtipos adotados de Zhao et al. (2026), validados na construção do evento. Antes eram string livre: um erro de digitação fazia a categoria sumir do agregado sem aviso. Agora `fpch audit --causes` responde *por que* falhou, não só *quantas vezes*.
+- **Atribuição de fonte** (`source`/`source_ref`) — de onde veio cada injeção de contexto: `nlah`, `politica`, `hook`, `mcp`, `memoria`, `skill`, `catalogo`, `usuario`, mais o identificador concreto. É o campo que permite responder **qual parte do harness produziu o efeito**; sem ele, "o harness ajudou" é anedota.
+- **Marcos do processo de falha** (`t_err`/`t_lock`/`t_obs`) — anotados por evento `annotate`, que aponta o `seq` alvo e **entra na cadeia de hash**. Marco é retrospectivo e a trilha é append-only, então anotar nunca reescreve: rotular em retrospecto fica, ele próprio, auditável. `fpch audit --process` calcula janela de correção e atraso de observabilidade.
+
+⚠️ **Limite declarado:** as janelas são medidas em **eventos da trilha**, não em turnos internos do agente. Zhao et al. medem passos de raciocínio-e-ação dentro de uma execução; o FPCH registra uma linha por chamada de backend. A adoção é da estrutura conceitual, não da unidade de medida — comparar os dois números seria erro de leitura.
+
+**Invariante de segurança:** evento `install` sem o campo `inverse` levanta `ValueError`. Instalar sem registrar como desinstalar é o que o requisito de composabilidade temporal proíbe. O executor (`fpch undo`) ainda não existe — só o campo e a invariante.
 
 ## Limites conhecidos (16/07/2026)
 
@@ -64,4 +77,4 @@ Essa é a linha real entre uso pretendido e banimento: o ilícito é **mentir so
 - `gemini` CLI **inutilizável** nesta conta (`IneligibleTierError`) — não está no catálogo.
 - `ollama` e `litellm` **não instalados** — a camada API-key (LiteLLM) ainda não existe. Só a camada assinatura está implementada.
 - Custo/potência dos modelos são **juízo do autor**, não medição. O audit log existe justamente para substituir isso por dado.
-- ~~Sem testes automatizados ainda.~~ **Superado:** 235 testes em `tests/` (11 arquivos, 3.164 linhas), `uv run --with pytest pytest tests/ -q`. Os demais limites desta lista são de 16/07/2026 e não foram reconferidos.
+- ~~Sem testes automatizados ainda.~~ **Superado:** 319 testes em `tests/` (12 arquivos, 4.184 linhas), `uv run --with pytest pytest tests/ -q`. Os demais limites desta lista são de 16/07/2026 e não foram reconferidos.
