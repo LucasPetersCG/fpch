@@ -1,10 +1,10 @@
-# FPCH — PoC (C1–C2)
+# FPCH — PoC (C1–C3)
 
 > 🧭 **Mapa de docs:** [`AGENTS.md`](../AGENTS.md) · [`docs/PROJECT.md`](../docs/PROJECT.md) · [`docs/STATUS.md`](../docs/STATUS.md) · [`TODO.md`](../TODO.md) · [`docs/analises/fpch-evidencias-desenvolvimento.md`](../docs/analises/fpch-evidencias-desenvolvimento.md) · [`docs/analises/camada-multi-modelo.md`](../docs/analises/camada-multi-modelo.md) · [`docs/referencias/estado-da-arte-2026-07.md`](../docs/referencias/estado-da-arte-2026-07.md)
 
-Código do FPCH. Nasceu cobrindo **C1** (camada de acesso multi-modelo) e a ferramenta **cannibalize**; desde a fatia funcional de 01/09/2026 instancia **as cinco camadas do framework** — política (`policy.py`), hooks determinísticos (`hooks.py`), laço de autoaprimoramento (`improve.py`), trilha verificável (`audit.py` + `fpch audit --verify`) e acesso multi-modelo (`router.py`/`backends.py`/`models.py`). Em 09/09/2026, C2 acrescentou a exploração automática em `discovery.py`. **13 módulos, 6.264 linhas físicas de código; 13 arquivos e 4.552 linhas físicas de testes; 339 testes passando e 1 ignorado** (medido em 09/09/2026).
+Código do FPCH. Nasceu cobrindo **C1** (camada de acesso multi-modelo) e a ferramenta **cannibalize**; desde a fatia funcional de 01/09/2026 instancia **as cinco camadas do framework** — política (`policy.py`), hooks determinísticos (`hooks.py`), laço de autoaprimoramento (`improve.py`), trilha verificável (`audit.py` + `fpch audit --verify`) e acesso multi-modelo (`router.py`/`backends.py`/`models.py`). Em 09/09/2026, C2 acrescentou a exploração automática em `discovery.py` e C3, a captura explícita de preferências em `interview.py`. **14 módulos, 6.686 linhas físicas de código; 14 arquivos e 4.977 linhas físicas de testes; 369 testes passando e 3 ignorados** (medido em 09/09/2026).
 
-**Status:** C1 funcional e verificado ponta a ponta desde 16/07/2026; C2 concluída e dogfoodada em 09/09/2026. Stack: **Python ≥3.11 + uv**. Zero dependências de runtime — só a stdlib e os CLIs oficiais já instalados.
+**Status:** C1 funcional e verificado ponta a ponta desde 16/07/2026; C2 e C3 concluídas em 09/09/2026. C4 fará a geração e instalação. Stack: **Python ≥3.11 + uv**. Zero dependências de runtime — só a stdlib e os CLIs oficiais já instalados.
 
 ## Uso
 
@@ -12,6 +12,9 @@ Código do FPCH. Nasceu cobrindo **C1** (camada de acesso multi-modelo) e a ferr
 uv run fpch models                    # catálogo, agrupado por pool de cota
 uv run fpch plan hard                 # mostra a cadeia de escalada, sem gastar cota
 uv run fpch discover . --json         # explora manifestos e CI/CD sem modificar o repo
+uv run fpch interview .               # captura preferências explícitas em TTY
+uv run fpch interview . --answers preferences.json --json
+uv run fpch interview . --answers - --output preferences.json
 uv run fpch ask standard "prompt"     # roteia
 uv run fpch ask hard --file spec.md   # prompt longo vem de arquivo
 uv run fpch audit                     # para onde a cota foi
@@ -26,7 +29,17 @@ uv run fpch audit --verify            # confere o encadeamento de hashes da tril
 
 O comando não executa subprocessos, não acessa a rede e não escreve no repositório inspecionado. Cada manifesto tem limite de 1 MiB; *symlinks*, *junctions* e demais *reparse points* são ignorados; problemas de leitura ou análise viram avisos estruturados. No dogfood do FPCH, detectou Python e `pytest >=8` em `pyproject.toml`, no escopo `group:dev`, sem CI/CD nem avisos, com exit 0.
 
-Limites assumidos neste corte: não interpreta configurações específicas de Poetry/PDM, *workspaces* nem classifica semanticamente as dependências. C3 fará a entrevista; C4 fará a geração e instalação. Evidências reproduzíveis e ressalvas estão em [`docs/analises/fpch-evidencias-desenvolvimento.md`](../docs/analises/fpch-evidencias-desenvolvimento.md).
+Limites assumidos neste corte: não interpreta configurações específicas de Poetry/PDM, *workspaces* nem classifica semanticamente as dependências. C3 faz a entrevista; C4 fará a geração e instalação. Evidências reproduzíveis e ressalvas estão em [`docs/analises/fpch-evidencias-desenvolvimento.md`](../docs/analises/fpch-evidencias-desenvolvimento.md).
+
+## Entrevista (`interview`)
+
+`fpch interview <repo> [--answers PATH|-] [--json] [--output PATH]` é o segundo estágio da face de criação. O modelo `FpchInterviewPreferences` usa esquema fechado versão 1 e registra exatamente três listas: `skills_on_demand`, `mandatory_linters` e `mandatory_formatters`. A descoberta C2 fornece contexto, mas **não pré-seleciona** respostas; toda preferência precisa ser informada pelo operador.
+
+Sem `--answers`, o comando entrevista em TTY. Com `--answers PATH`, lê JSON de um arquivo; com `--answers -`, lê stdin como bytes e exige UTF-8 válido. O JSON é fechado e canônico: campos extras ou ausentes e versões desconhecidas falham; o documento tem limite de 64 KiB, cada lista aceita até 64 IDs, os identificadores usam um conjunto ASCII conservador e a ordem declarada é preservada. Mensagens de duplicidade não ecoam o identificador recebido.
+
+O comando é offline: não executa subprocessos, não usa rede, não instala componentes e, por padrão, apenas apresenta o resultado. Só grava quando `--output` é fornecido explicitamente. Essa gravação é criação exclusiva, com modo `0600`; recusa alvo ou ancestral que seja *symlink*, *junction* ou outro *reparse point*, e remove uma saída parcial somente se ela ainda tiver a identidade do arquivo criado pela própria execução. Permanece um limite TOCTOU inerente no intervalo entre verificações do caminho e chamadas ao sistema de arquivos; portanto, isto é contenção defensiva, não garantia formal contra um adversário local concorrente.
+
+O smoke test real foi não interativo e usou **respostas sintéticas** (`context-mode:ctx-search`, `ruff`, `black`), não preferências do autor; também não forneceu `--output`, portanto não persistiu arquivo. C4 continuará responsável por gerar e instalar o harness.
 
 Canibalizar um artefato de terceiro:
 

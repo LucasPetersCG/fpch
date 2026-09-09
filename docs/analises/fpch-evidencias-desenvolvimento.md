@@ -77,3 +77,69 @@ Quando o autor reabrir a frente acadêmica após os dias de desenvolvimento, est
 6. a ressalva metodológica do E2E condicionado ao suporte do sistema operacional.
 
 Antes de integrar esses pontos ao texto acadêmico, é necessário repetir as medições no estado final do código e separar claramente **evidência de funcionamento do artefato** de **validação da pesquisa**. C2 comprova comportamento técnico; por si só, não valida o arranjo fatorial nem as perguntas de pesquisa ainda abertas.
+
+## 6. Apêndice de desenvolvimento: C3 — Entrevista
+
+O subcomando `fpch interview <repo> [--answers PATH|-] [--json] [--output PATH]` materializa o segundo estágio da face de criação. Ele recebe o repositório como contexto, mas não transforma achados de C2 em escolhas: a descoberta não pré-seleciona *skills*, linters ou formatadores. A separação é deliberada para distinguir evidência observável do repositório de preferência declarada pelo desenvolvedor.
+
+`FpchInterviewPreferences` fixa o esquema fechado versão 1 com três campos:
+
+| Campo | Semântica |
+|---|---|
+| `skills_on_demand` | *skills* que o operador quer disponibilizar sob demanda |
+| `mandatory_linters` | linters que o operador declara obrigatórios |
+| `mandatory_formatters` | formatadores que o operador declara obrigatórios |
+
+A entrevista funciona em TTY ou recebe respostas JSON por `--answers PATH`; `--answers -` lê stdin binário e exige UTF-8 válido. O documento é limitado a 64 KiB; cada campo aceita no máximo 64 IDs; os IDs seguem uma gramática ASCII conservadora e a ordem de entrada é preservada. O contrato rejeita campos extras ou ausentes, versão desconhecida, tipos inadequados e duplicidades. Para reduzir vazamento acidental por diagnóstico, a mensagem de duplicidade não ecoa o ID fornecido.
+
+## 7. Contrato negativo e persistência explícita
+
+C3 não executa subprocessos, não acessa a rede e não instala componentes. Sem `--output`, também não escreve: `--json` altera a representação emitida, não a persistência. Geração e instalação continuam pertencendo a C4.
+
+Quando `--output` é solicitado explicitamente, a implementação:
+
+1. usa criação exclusiva, sem sobrescrever arquivo existente;
+2. solicita permissões `0600` para o arquivo criado;
+3. recusa alvo ou ancestral identificado como *symlink*, *junction* ou outro *reparse point*;
+4. se uma falha ocorre após a criação, só remove o parcial após confirmar que ainda é o mesmo objeto criado pela execução.
+
+Essas defesas reduzem a superfície de troca de alvo e remoção indevida, mas não eliminam todas as corridas de sistema de arquivos. Há um limite TOCTOU residual entre a validação de componentes do caminho e as primitivas disponíveis no sistema operacional. A formulação correta é **contenção defensiva com limite documentado**, não segurança formal contra um adversário local concorrente.
+
+## 8. Smoke test: o que foi e o que não foi demonstrado
+
+O smoke test real foi executado em modo não interativo, com respostas **sintéticas**:
+
+| Campo | Valor sintético |
+|---|---|
+| `skills_on_demand` | `context-mode:ctx-search` |
+| `mandatory_linters` | `ruff` |
+| `mandatory_formatters` | `black` |
+
+Esses valores foram escolhidos apenas para exercitar o contrato e **não representam preferências do autor**. A execução não usou `--output` e, portanto, não persistiu arquivo. Ela demonstra que uma entrada JSON válida percorre a CLI e produz a representação esperada; não demonstra instalação, adoção das ferramentas citadas nem validação das escolhas por um usuário real.
+
+## 9. Verificação executada após C3
+
+| Verificação | Resultado em 09/09/2026 |
+|---|---|
+| Testes focais de C3 | **30 passed, 2 skipped** |
+| Testes focais C2+C3 | **39 passed, 3 skipped em 0,34 s** |
+| Suíte completa | **369 passed, 3 skipped em 5,24 s** |
+| Código do protótipo | 14 módulos, 6.686 linhas físicas em `src/fpch/` |
+| Testes | 14 arquivos, 4.977 linhas físicas |
+| Integridade textual do diff | `git diff --check` limpo |
+| Entregáveis acadêmicos | `docs/tcc/**` sem diff |
+
+Os três testes ignorados são exatamente os E2Es de *symlink* que o Windows da execução não autorizou criar (`WinError 1314`): escape de fronteira em C2, alvo de saída em C3 e ancestral de saída em C3. Testes simulados de *junction/reparse point* e da limpeza condicionada à identidade do arquivo passaram. O registro preserva a distinção: um teste não executado por restrição do SO não conta como aprovado, e a simulação não substitui integralmente o E2E nativo.
+
+## 10. Candidatos adicionais de evidência para integração acadêmica futura
+
+Após o fechamento dos dias de desenvolvimento e nova medição no estado final, C3 poderá sustentar:
+
+1. a existência executável do segundo estágio da face de criação;
+2. a separação operacional entre fatos descobertos em C2 e preferências explicitamente declaradas em C3;
+3. um esquema de preferências fechado, versionado e limitado;
+4. o contrato negativo de zero subprocesso, rede, instalação e escrita implícita;
+5. a estratégia defensiva de persistência explícita, incluindo seu limite TOCTOU;
+6. a evidência honesta de um smoke test sintético, sem apresentá-lo como preferência do autor ou entrevista com participante.
+
+Como em C2, esses pontos comprovam propriedades técnicas do artefato, não validam por si mesmos a pesquisa, o arranjo fatorial ou a adequação das preferências a um desenvolvedor real. C4 permanece responsável por transformar descoberta e preferências em artefatos gerados e instaláveis.

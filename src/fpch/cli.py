@@ -53,6 +53,7 @@ from . import (
     discovery,
     hooks,
     improve,
+    interview,
     models,
     policy,
     quotes,
@@ -318,6 +319,68 @@ def _cmd_discover(args: argparse.Namespace) -> int:
     print(f"sinais de CI/CD: {len(payload['ci_cd'])}")
     if payload["warnings"]:
         print(f"avisos: {len(payload['warnings'])}")
+    return 0
+
+def _cmd_interview(args: argparse.Namespace) -> int:
+    """Coleta ou valida preferências explícitas usando a descoberta como contexto."""
+    try:
+        report = discovery.discover(args.repo)
+    except discovery.FpchDiscoveryError as exc:
+        print(f"erro de descoberta: {exc}", file=sys.stderr)
+        return EXIT_USO
+
+    try:
+        if args.answers is not None:
+            source = (
+                getattr(sys.stdin, "buffer", sys.stdin)
+                if args.answers == "-"
+                else Path(args.answers)
+            )
+            preferences = interview.load_answers(source)
+        else:
+            if not sys.stdin.isatty():
+                print(
+                    "erro de uso: stdin não é interativo; informe respostas com "
+                    "--answers CAMINHO ou --answers -",
+                    file=sys.stderr,
+                )
+                return EXIT_USO
+
+            if args.json:
+                def input_from_stderr(prompt: str) -> str:
+                    print(prompt, end="", file=sys.stderr, flush=True)
+                    line = sys.stdin.readline()
+                    if line == "":
+                        raise EOFError
+                    return line.rstrip("\r\n")
+
+                preferences = interview.interview(
+                    report,
+                    input_fn=input_from_stderr,
+                    output_fn=lambda message: print(message, file=sys.stderr),
+                )
+            else:
+                preferences = interview.interview(report)
+
+        if args.output is not None:
+            interview.save_new(args.output, preferences)
+    except interview.FpchInterviewError as exc:
+        print(f"erro de entrevista: {exc}", file=sys.stderr)
+        return EXIT_USO
+
+    if args.json:
+        print(interview.dumps(preferences), end="")
+        return 0
+
+    def human(items: tuple[str, ...]) -> str:
+        return ", ".join(items) or "nenhum"
+
+    print("preferências registradas:")
+    print(f"  skills sob demanda: {human(preferences.skills_on_demand)}")
+    print(f"  linters obrigatórios: {human(preferences.mandatory_linters)}")
+    print(f"  formatadores obrigatórios: {human(preferences.mandatory_formatters)}")
+    if args.output is not None:
+        print(f"  arquivo criado: {Path(args.output)}")
     return 0
 
 
@@ -674,6 +737,24 @@ def build_parser() -> argparse.ArgumentParser:
     ds.add_argument("repo", help="diretório do repositório a inspecionar")
     ds.add_argument("--json", action="store_true", help="emite o relatório como JSON")
     ds.set_defaults(fn=_cmd_discover)
+
+    iv = sub.add_parser(
+        "interview",
+        help="coleta preferências explícitas usando a descoberta como contexto",
+    )
+    iv.add_argument("repo", help="diretório do repositório usado como contexto")
+    iv.add_argument(
+        "--answers",
+        metavar="CAMINHO|-",
+        help="valida respostas JSON de um arquivo ou de stdin com '-'",
+    )
+    iv.add_argument("--json", action="store_true", help="emite as preferências como JSON")
+    iv.add_argument(
+        "--output",
+        metavar="CAMINHO",
+        help="cria exclusivamente este arquivo; nunca sobrescreve",
+    )
+    iv.set_defaults(fn=_cmd_interview)
 
     au = sub.add_parser("audit", help="resumo de uso por pool")
     au.add_argument("--verify", action="store_true",
