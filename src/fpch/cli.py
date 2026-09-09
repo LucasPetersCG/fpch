@@ -11,6 +11,7 @@
     fpch audit --process             marcos do processo de falha, por trajetória
     fpch improve                     lê a trilha e PROPÕE mudança de política (não aplica)
     fpch --policy P improve --apply <id>   autoriza uma proposta, no arquivo que você nomeou
+    fpch discover <repo> --json      descobre linguagens, dependências e CI/CD, só leitura
     fpch quote-check <ficha> <fonte> trechos entre aspas existem na fonte?
     fpch canib add <url> [--note]    enfileira alvo
     fpch canib list                  fila
@@ -44,7 +45,19 @@ import math
 import sys
 from pathlib import Path
 
-from . import audit, backends, cannibalize, citations, hooks, improve, models, policy, quotes, router
+from . import (
+    audit,
+    backends,
+    cannibalize,
+    citations,
+    discovery,
+    hooks,
+    improve,
+    models,
+    policy,
+    quotes,
+    router,
+)
 from .models import TaskClass
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -284,6 +297,28 @@ def _cmd_improve(args: argparse.Namespace) -> int:
                              label=args.label)
     print(improve.format_analise(analise))
     return analise.exit_code
+
+
+def _cmd_discover(args: argparse.Namespace) -> int:
+    """Descobre sinais explícitos de um repositório, sem escrever nele."""
+    try:
+        report = discovery.discover(args.repo)
+    except discovery.FpchDiscoveryError as exc:
+        print(f"erro de descoberta: {exc}", file=sys.stderr)
+        return EXIT_USO
+
+    payload = report.as_dict()
+    if args.json:
+        print(json.dumps(payload, ensure_ascii=False, sort_keys=True))
+        return 0
+
+    print(f"repositório: {payload['repo']}")
+    print("linguagens: " + (", ".join(payload["languages"]) or "nenhuma detectada"))
+    print(f"dependências: {len(payload['dependencies'])}")
+    print(f"sinais de CI/CD: {len(payload['ci_cd'])}")
+    if payload["warnings"]:
+        print(f"avisos: {len(payload['warnings'])}")
+    return 0
 
 
 def _cmd_audit(args: argparse.Namespace) -> int:
@@ -631,6 +666,14 @@ def build_parser() -> argparse.ArgumentParser:
     im.add_argument("--propostas", help="diretório das propostas (default: FPCH_PROPOSTAS_DIR / ~/.fpch/propostas)")
     im.add_argument("--label", help="rótulo para os eventos de recusa na trilha")
     im.set_defaults(fn=_cmd_improve)
+
+    ds = sub.add_parser(
+        "discover",
+        help="descobre linguagens, dependências e CI/CD de um repositório (somente leitura)",
+    )
+    ds.add_argument("repo", help="diretório do repositório a inspecionar")
+    ds.add_argument("--json", action="store_true", help="emite o relatório como JSON")
+    ds.set_defaults(fn=_cmd_discover)
 
     au = sub.add_parser("audit", help="resumo de uso por pool")
     au.add_argument("--verify", action="store_true",

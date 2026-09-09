@@ -1,16 +1,17 @@
-# FPCH — PoC (C1)
+# FPCH — PoC (C1–C2)
 
-> 🧭 **Mapa de docs:** [`AGENTS.md`](../AGENTS.md) · [`docs/PROJECT.md`](../docs/PROJECT.md) · [`docs/STATUS.md`](../docs/STATUS.md) · [`TODO.md`](../TODO.md) · [`docs/analises/camada-multi-modelo.md`](../docs/analises/camada-multi-modelo.md) · [`docs/referencias/estado-da-arte-2026-07.md`](../docs/referencias/estado-da-arte-2026-07.md)
+> 🧭 **Mapa de docs:** [`AGENTS.md`](../AGENTS.md) · [`docs/PROJECT.md`](../docs/PROJECT.md) · [`docs/STATUS.md`](../docs/STATUS.md) · [`TODO.md`](../TODO.md) · [`docs/analises/fpch-evidencias-desenvolvimento.md`](../docs/analises/fpch-evidencias-desenvolvimento.md) · [`docs/analises/camada-multi-modelo.md`](../docs/analises/camada-multi-modelo.md) · [`docs/referencias/estado-da-arte-2026-07.md`](../docs/referencias/estado-da-arte-2026-07.md)
 
-Código do FPCH. Nasceu cobrindo **C1** (camada de acesso multi-modelo) e a ferramenta **cannibalize**; desde a fatia funcional de 01/09/2026 instancia **as cinco camadas do framework** — política (`policy.py`), hooks determinísticos (`hooks.py`), laço de autoaprimoramento (`improve.py`), trilha verificável (`audit.py` + `fpch audit --verify`) e acesso multi-modelo (`router.py`/`backends.py`/`models.py`). **12 arquivos, 5.433 linhas, 319 testes passando** (medido em 03/09/2026).
+Código do FPCH. Nasceu cobrindo **C1** (camada de acesso multi-modelo) e a ferramenta **cannibalize**; desde a fatia funcional de 01/09/2026 instancia **as cinco camadas do framework** — política (`policy.py`), hooks determinísticos (`hooks.py`), laço de autoaprimoramento (`improve.py`), trilha verificável (`audit.py` + `fpch audit --verify`) e acesso multi-modelo (`router.py`/`backends.py`/`models.py`). Em 09/09/2026, C2 acrescentou a exploração automática em `discovery.py`. **13 módulos, 6.264 linhas físicas de código; 13 arquivos e 4.552 linhas físicas de testes; 339 testes passando e 1 ignorado** (medido em 09/09/2026).
 
-**Status:** funcional e verificado ponta a ponta em 16/07/2026. Stack escolhida nesta sessão (C1 estava aberto): **Python ≥3.11 + uv**. Zero dependências de runtime — só a stdlib e os CLIs oficiais já instalados.
+**Status:** C1 funcional e verificado ponta a ponta desde 16/07/2026; C2 concluída e dogfoodada em 09/09/2026. Stack: **Python ≥3.11 + uv**. Zero dependências de runtime — só a stdlib e os CLIs oficiais já instalados.
 
 ## Uso
 
 ```bash
 uv run fpch models                    # catálogo, agrupado por pool de cota
 uv run fpch plan hard                 # mostra a cadeia de escalada, sem gastar cota
+uv run fpch discover . --json         # explora manifestos e CI/CD sem modificar o repo
 uv run fpch ask standard "prompt"     # roteia
 uv run fpch ask hard --file spec.md   # prompt longo vem de arquivo
 uv run fpch audit                     # para onde a cota foi
@@ -18,6 +19,14 @@ uv run fpch audit --causes            # falhas agregadas por causa raiz e por fo
 uv run fpch audit --process           # marcos t_err/t_lock/t_obs por trajetória
 uv run fpch audit --verify            # confere o encadeamento de hashes da trilha
 ```
+
+## Exploração automática (`discover`)
+
+`fpch discover <repo> --json` é o primeiro estágio da face de criação. Ele analisa, de forma **estática, offline, determinística e somente leitura**, `pyproject.toml`, `requirements*.txt`, `package.json`, `Cargo.toml`, `go.mod` e configurações de GitHub Actions, GitLab CI, Jenkins e Azure Pipelines. Em Python, distingue dependências do projeto, opcionais e grupos PEP 735.
+
+O comando não executa subprocessos, não acessa a rede e não escreve no repositório inspecionado. Cada manifesto tem limite de 1 MiB; *symlinks*, *junctions* e demais *reparse points* são ignorados; problemas de leitura ou análise viram avisos estruturados. No dogfood do FPCH, detectou Python e `pytest >=8` em `pyproject.toml`, no escopo `group:dev`, sem CI/CD nem avisos, com exit 0.
+
+Limites assumidos neste corte: não interpreta configurações específicas de Poetry/PDM, *workspaces* nem classifica semanticamente as dependências. C3 fará a entrevista; C4 fará a geração e instalação. Evidências reproduzíveis e ressalvas estão em [`docs/analises/fpch-evidencias-desenvolvimento.md`](../docs/analises/fpch-evidencias-desenvolvimento.md).
 
 Canibalizar um artefato de terceiro:
 
@@ -77,4 +86,4 @@ Essa é a linha real entre uso pretendido e banimento: o ilícito é **mentir so
 - `gemini` CLI **inutilizável** nesta conta (`IneligibleTierError`) — não está no catálogo.
 - `ollama` e `litellm` **não instalados** — a camada API-key (LiteLLM) ainda não existe. Só a camada assinatura está implementada.
 - Custo/potência dos modelos são **juízo do autor**, não medição. O audit log existe justamente para substituir isso por dado.
-- ~~Sem testes automatizados ainda.~~ **Superado:** 319 testes em `tests/` (12 arquivos, 4.184 linhas), `uv run --with pytest pytest tests/ -q`. Os demais limites desta lista são de 16/07/2026 e não foram reconferidos.
+- ~~Sem testes automatizados ainda.~~ **Superado:** 339 testes aprovados e 1 ignorado em `tests/` (13 arquivos, 4.552 linhas), `uv run --with pytest pytest tests/ -q`. O único *skip* ocorreu porque o Windows não permitiu criar o *symlink* do E2E de escape; a contenção de *reparse points* está implementada. Os demais limites desta lista são de 16/07/2026 e não foram reconferidos.
