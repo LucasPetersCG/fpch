@@ -49,13 +49,14 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 import sys
 from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from pathlib import Path
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 #: Desfechos válidos de uma trajetória.
 OUTCOMES = ("ok", "failed", "abandoned")
@@ -100,6 +101,11 @@ SOURCES = ("nlah", "politica", "hook", "mcp", "memoria", "skill", "catalogo", "u
 #: necessariamente o primeiro erro; `t_lock` é o ponto após o qual a trajetória é
 #: empiricamente irrecuperável; `t_obs` é o primeiro sinal observável do erro.
 MARKS = ("t_err", "t_lock", "t_obs")
+
+#: Proveniência fechada do timeout efetivo de um hook. ``policy`` significa que
+#: há um campo de política causalmente responsável; ``explicit`` é override do
+#: chamador e, por definição, não declara campo governante.
+TIMEOUT_ORIGINS = ("policy", "explicit")
 
 #: Campos de vocabulário fechado cuja validação é uma pertinência simples. O
 #: `cause_subtype` fica de fora porque sua validade depende da categoria.
@@ -177,6 +183,12 @@ class Event:
     source: str | None = None           # vocabulário fechado (SOURCES)
     source_ref: str | None = None       # identificador concreto, texto livre
 
+    # governança causal de hooks (schema 4)
+    timed_out: bool | None = None        # True somente após subprocess.TimeoutExpired
+    timeout_s: float | None = None       # timeout efetivamente entregue ao processo
+    timeout_origin: str | None = None    # vocabulário fechado (TIMEOUT_ORIGINS)
+    governing_field: str | None = None   # hoje, somente "verificacao.timeout_s"
+
     # annotate: marco retrospectivo sobre um evento já gravado
     mark: str | None = None             # "t_err" | "t_lock" | "t_obs"
     target_seq: int | None = None       # `seq` do evento marcado, mesma trajetória
@@ -225,6 +237,38 @@ class Event:
                     f"{self.cause_category!r}: {self.cause_subtype!r}. "
                     f"Aceitos nesta categoria: {', '.join(aceitos)}."
                 )
+
+        timeout_meta = (
+            self.timed_out, self.timeout_s, self.timeout_origin, self.governing_field,
+        )
+        if any(valor is not None for valor in timeout_meta):
+            if self.event != "verify" or self.source != "hook":
+                raise ValueError(
+                    "metadados de timeout só pertencem a evento verify com source='hook'."
+                )
+            if type(self.timed_out) is not bool:
+                raise ValueError("timed_out deve ser booleano quando metadados de timeout existem.")
+            if (
+                isinstance(self.timeout_s, bool)
+                or not isinstance(self.timeout_s, (int, float))
+                or not math.isfinite(float(self.timeout_s))
+                or self.timeout_s <= 0
+            ):
+                raise ValueError("timeout_s deve ser número positivo.")
+            if self.timeout_origin not in TIMEOUT_ORIGINS:
+                raise ValueError(
+                    f"timeout_origin inválido: {self.timeout_origin!r}. "
+                    f"Aceitos: {', '.join(TIMEOUT_ORIGINS)}."
+                )
+            if self.timeout_origin == "policy":
+                if self.governing_field != "verificacao.timeout_s":
+                    raise ValueError(
+                        "timeout de origem policy exige governing_field='verificacao.timeout_s'."
+                    )
+            elif self.governing_field is not None:
+                raise ValueError("timeout explicit não pode declarar campo de política governante.")
+            if self.timed_out and self.verdict != "fail":
+                raise ValueError("timed_out=True exige verdict='fail'.")
 
         if self.event == "install" and not self.inverse:
             raise ValueError(

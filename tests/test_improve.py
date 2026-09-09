@@ -20,6 +20,7 @@ filho. Toda trilha, toda política e todo diretório de propostas vivem em `tmp_
 from __future__ import annotations
 
 import json
+import sys
 import tomllib
 from dataclasses import fields
 
@@ -62,8 +63,13 @@ def pol():
 
 def _verify(trilha, *, tid="t1", component="pytest", verdict="fail",
             evidence="exit=None; o hook estourou o timeout de 120s e foi interrompido",
-            fault_side="infraestrutura", cause_category=None, label=None) -> bool:
+            fault_side="infraestrutura", cause_category=None, label=None,
+            timed_out=None, timeout_s=120, timeout_origin="policy",
+            governing_field="verificacao.timeout_s", source="hook",
+            schema_version=audit.SCHEMA_VERSION) -> bool:
     """Grava um evento `verify` na trilha, encadeado como o `hooks.py` faria."""
+    if timed_out is None:
+        timed_out = verdict == "fail" and "estourou o timeout" in evidence.lower()
     return audit.write(
         audit.Event(
             event="verify",
@@ -75,6 +81,13 @@ def _verify(trilha, *, tid="t1", component="pytest", verdict="fail",
             evidence=evidence,
             fault_side=fault_side,
             cause_category=cause_category,
+            source=source,
+            source_ref=component if source == "hook" else source,
+            timed_out=timed_out,
+            timeout_s=timeout_s,
+            timeout_origin=timeout_origin,
+            governing_field=governing_field,
+            schema_version=schema_version,
         ),
         path=trilha,
     )
@@ -132,11 +145,21 @@ def test_proposta_nasce_quando_as_tres_condicoes_valem(pol, trilha, propostas):
     assert p.fault_side == "infraestrutura"
     # (c) o caminho de remoção é declarado, e cita o valor de volta.
     assert p.remocao
-    assert str(pol.backends.timeout_s) in p.remocao
+    assert str(pol.verificacao.timeout_s) in p.remocao
     # a alteração é de bloco externalizável (seção 5.2).
     assert p.bloco in improve.BLOCOS_EXTERNALIZAVEIS
-    assert (p.bloco, p.campo) == ("backends", "timeout_s")
-    assert p.valor_proposto == pol.backends.timeout_s * 2
+    assert (p.bloco, p.campo) == ("verificacao", "timeout_s")
+    assert p.valor_proposto == pol.verificacao.timeout_s * 2
+
+
+def test_hook_com_schema_futuro_nao_autoriza_proposta(pol, trilha, propostas):
+    _verify(trilha, schema_version=audit.SCHEMA_VERSION + 1)
+
+    an = improve.propor(pol, trilha=trilha, propostas_dir=propostas)
+
+    assert an.proposta is None
+    assert an.recusas[0].codigo == improve.RECUSA_CAMPO_NAO_GOVERNA
+    assert not list(propostas.glob("*.json"))
 
 
 def test_proposta_e_gravada_em_arquivo_json_com_o_id_no_nome(pol, trilha, propostas):
@@ -161,18 +184,17 @@ def test_id_e_deterministico_para_a_mesma_evidencia(pol, trilha, propostas):
     assert len(list(propostas.glob("*.json"))) == 1
 
 
-def test_regra_de_assinatura_propoe_reconhecer_falha_silenciosa(trilha, propostas, tmp_path):
-    """`exit == 0` que não é sucesso: a segunda regra, sobre [falha].assinaturas."""
+def test_assinatura_emitida_por_hook_nao_altera_falha(trilha, propostas, tmp_path):
+    """Hook não prova que [falha].assinaturas governou a chamada de modelo."""
     caminho = _politica(tmp_path, '[falha]\nassinaturas = ["auto-denied"]\n')
     pol = policy_mod.load(caminho)
     _verify(trilha, component="rota", evidence="saída: quota exceeded para o pool agy:google")
 
     an = improve.propor(pol, trilha=trilha, propostas_dir=propostas)
 
-    assert an.proposta is not None, an.recusas
-    assert (an.proposta.bloco, an.proposta.campo) == ("falha", "assinaturas")
-    assert "quota exceeded" in an.proposta.valor_proposto
-    assert "auto-denied" in an.proposta.valor_proposto
+    assert an.proposta is None
+    assert an.recusas[0].codigo == improve.RECUSA_CAMPO_NAO_GOVERNA
+    assert not list(propostas.glob("*.json"))
 
 
 # ---------------------------------------------------------------------------
@@ -316,7 +338,8 @@ def test_apply_altera_o_bloco_externalizavel_e_registra(trilha, propostas, tmp_p
 
     assert res.ok, res.recusa
     assert res.exit_code == 0
-    assert policy_mod.load(caminho).backends.timeout_s == 1200
+    assert policy_mod.load(caminho).verificacao.timeout_s == 240
+    assert policy_mod.load(caminho).backends.timeout_s == 600
     # o resto do arquivo sobreviveu: edição cirúrgica, não regravação
     assert policy_mod.load(caminho).backends.arg_limit == 24000
     registro = _linhas(trilha)[-1]
@@ -364,7 +387,7 @@ def test_apply_recusa_bloco_imutavel_e_registra(trilha, propostas, tmp_path):
     caminho = _politica(tmp_path, "[backends]\ntimeout_s = 600\n")
     _verify(trilha)
     forjada = {
-        "id": "prop-forjada",
+        "id": "prop-deadbeef0001",
         "criado_em": "2026-08-31T00:00:00.000000-03:00",
         "trajectory_id": "t1",
         "component": "pytest",
@@ -384,10 +407,10 @@ def test_apply_recusa_bloco_imutavel_e_registra(trilha, propostas, tmp_path):
         "aplicado_em": None,
     }
     propostas.mkdir(parents=True, exist_ok=True)
-    (propostas / "prop-forjada.json").write_text(json.dumps(forjada), encoding="utf-8")
+    (propostas / "prop-deadbeef0001.json").write_text(json.dumps(forjada), encoding="utf-8")
     antes = caminho.read_bytes()
 
-    res = improve.aplicar("prop-forjada", policy_path=caminho, trilha=trilha,
+    res = improve.aplicar("prop-deadbeef0001", policy_path=caminho, trilha=trilha,
                           propostas_dir=propostas)
 
     assert not res.ok
@@ -429,30 +452,31 @@ def test_apply_recusa_id_inexistente_como_erro_de_uso(trilha, propostas, tmp_pat
 
 
 def test_apply_recusa_quando_a_politica_ja_mudou(trilha, propostas, tmp_path):
-    """Proposta calculada sobre 600s não se aplica a uma política que hoje diz 900s."""
-    caminho = _politica(tmp_path, "[backends]\ntimeout_s = 600\n")
+    """Proposta calculada sobre 120s não se aplica a uma política que hoje diz 180s."""
+    caminho = _politica(tmp_path, "[verificacao]\ntimeout_s = 120\n")
     pol = policy_mod.load(caminho)
     _verify(trilha)
     an = improve.propor(pol, trilha=trilha, propostas_dir=propostas)
-    caminho.write_text("[backends]\ntimeout_s = 900\n", encoding="utf-8")
+    caminho.write_text("[verificacao]\ntimeout_s = 180\n", encoding="utf-8")
 
     res = improve.aplicar(an.proposta.id, policy_path=caminho, trilha=trilha,
                           propostas_dir=propostas)
 
     assert not res.ok
     assert res.recusa.codigo == improve.RECUSA_VALOR_DIVERGENTE
-    assert policy_mod.load(caminho).backends.timeout_s == 900
+    assert policy_mod.load(caminho).verificacao.timeout_s == 180
 
 
 def test_apply_de_proposta_com_schema_futuro_e_recusado(trilha, propostas, tmp_path):
     caminho = _politica(tmp_path, "[backends]\ntimeout_s = 600\n")
     propostas.mkdir(parents=True, exist_ok=True)
-    (propostas / "prop-futuro.json").write_text(
-        json.dumps({"schema_version": 999, "bloco": "backends", "campo": "timeout_s",
+    (propostas / "prop-deadbeef0003.json").write_text(
+        json.dumps({"id": "prop-deadbeef0003", "schema_version": 999,
+                    "bloco": "backends", "campo": "timeout_s",
                     "trajectory_id": "t1", "component": "x"}),
         encoding="utf-8",
     )
-    res = improve.aplicar("prop-futuro", policy_path=caminho, trilha=trilha,
+    res = improve.aplicar("prop-deadbeef0003", policy_path=caminho, trilha=trilha,
                           propostas_dir=propostas)
 
     assert not res.ok
@@ -517,7 +541,7 @@ def test_apply_restaura_politica_se_o_resultado_nao_carregar(trilha, propostas, 
 
 def test_blocos_externalizaveis_espelham_policy():
     """Se `Policy` ganhar um bloco, este teste falha até o portão saber dele."""
-    campos = {f.name for f in fields(policy_mod.Policy)} - {"origem", "fonte"}
+    campos = {f.name for f in fields(policy_mod.Policy)} - {"origem", "fonte", "causa_raiz"}
     assert set(improve.BLOCOS_EXTERNALIZAVEIS) == campos
 
 
@@ -527,14 +551,15 @@ def test_nenhum_bloco_imutavel_e_externalizavel():
 
 def test_toda_regra_aponta_para_bloco_externalizavel(pol):
     for regra in improve.REGRAS:
-        assert regra.bloco in improve.BLOCOS_EXTERNALIZAVEIS
-        assert hasattr(getattr(pol, regra.bloco), regra.campo)
+        for _origem, bloco, campo in regra.governanca:
+            assert bloco in improve.BLOCOS_EXTERNALIZAVEIS
+            assert hasattr(getattr(pol, bloco), campo)
 
 
 def test_timeout_nao_passa_do_teto(trilha, propostas, tmp_path):
-    caminho = _politica(tmp_path, f"[backends]\ntimeout_s = {improve.TETO_TIMEOUT_S}\n")
+    caminho = _politica(tmp_path, f"[verificacao]\ntimeout_s = {improve.TETO_TIMEOUT_S}\n")
     pol = policy_mod.load(caminho)
-    _verify(trilha)
+    _verify(trilha, timeout_s=improve.TETO_TIMEOUT_S)
 
     an = improve.propor(pol, trilha=trilha, propostas_dir=propostas)
 
@@ -587,7 +612,7 @@ def test_cli_apply_aplica_a_proposta(trilha, propostas, tmp_path, capsys):
                      "--trilha", str(trilha), "--propostas", str(propostas)])
 
     assert code == 0
-    assert policy_mod.load(caminho).backends.timeout_s == 1200
+    assert policy_mod.load(caminho).verificacao.timeout_s == 240
 
 
 # ---------------------------------------------------------------------------
@@ -598,9 +623,9 @@ def test_recusa_com_regra_identificada_grava_source_politica(pol, trilha, propos
     """RECUSA_SEM_MUDANCA nasce depois de `_casa_regra` já ter identificado uma
     `Regra` — é o caso em que a fonte É determinável, e por isso o evento gravado
     carrega `source='politica'` com `source_ref` igual ao nome concreto da regra."""
-    caminho = _politica(tmp_path, f"[backends]\ntimeout_s = {improve.TETO_TIMEOUT_S}\n")
+    caminho = _politica(tmp_path, f"[verificacao]\ntimeout_s = {improve.TETO_TIMEOUT_S}\n")
     pol = policy_mod.load(caminho)
-    _verify(trilha)
+    _verify(trilha, timeout_s=improve.TETO_TIMEOUT_S)
 
     an = improve.propor(pol, trilha=trilha, propostas_dir=propostas)
 
@@ -655,7 +680,7 @@ def test_apply_recusa_apos_schema_valido_tambem_grava_source_politica(trilha, pr
     caminho = _politica(tmp_path, "[backends]\ntimeout_s = 600\n")
     _verify(trilha)
     forjada = {
-        "id": "prop-forjada-2",
+        "id": "prop-deadbeef0002",
         "criado_em": "2026-08-31T00:00:00.000000-03:00",
         "trajectory_id": "t1",
         "component": "pytest",
@@ -675,9 +700,9 @@ def test_apply_recusa_apos_schema_valido_tambem_grava_source_politica(trilha, pr
         "aplicado_em": None,
     }
     propostas.mkdir(parents=True, exist_ok=True)
-    (propostas / "prop-forjada-2.json").write_text(json.dumps(forjada), encoding="utf-8")
+    (propostas / "prop-deadbeef0002.json").write_text(json.dumps(forjada), encoding="utf-8")
 
-    res = improve.aplicar("prop-forjada-2", policy_path=caminho, trilha=trilha,
+    res = improve.aplicar("prop-deadbeef0002", policy_path=caminho, trilha=trilha,
                           propostas_dir=propostas)
 
     assert not res.ok

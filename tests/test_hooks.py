@@ -15,6 +15,7 @@ shell POSIX. Toda trilha vai para `tmp_path`, nunca para `~/.fpch` real.
 from __future__ import annotations
 
 import json
+import math
 import sys
 
 import pytest
@@ -256,6 +257,10 @@ def test_evento_de_timeout_e_gravado_na_trilha_sem_ser_rejeitado(trilha):
     assert registro["cause_category"] == "ambiente"
     assert registro["cause_subtype"] == "bloqueio_de_ambiente"
     assert registro["fault_side"] == "infraestrutura"
+    assert registro["timed_out"] is True
+    assert registro["timeout_s"] == 0.2
+    assert registro["timeout_origin"] == "explicit"
+    assert "governing_field" not in registro
 
 
 def test_evento_de_binario_ausente_e_gravado_na_trilha_sem_ser_rejeitado(trilha):
@@ -266,6 +271,19 @@ def test_evento_de_binario_ausente_e_gravado_na_trilha_sem_ser_rejeitado(trilha)
     registro = _linhas(trilha)[-1]
     assert registro["cause_category"] == "ambiente"
     assert registro["cause_subtype"] == "bloqueio_de_ambiente"
+    assert registro["timed_out"] is False
+
+
+def test_stderr_com_palavra_timeout_nao_finge_timeout_real(trilha):
+    h = _hook(
+        cmd=_py("import sys; print('timeout textual', file=sys.stderr); sys.exit(1)"),
+        criterio="exit_zero",
+    )
+    r = hooks.run_hook(h, audit_path=trilha)
+
+    assert "timeout" in r.evidence
+    assert r.timed_out is False
+    assert _linhas(trilha)[-1]["timed_out"] is False
 
 
 # ---------------------------------------------------------------------------
@@ -426,6 +444,41 @@ def test_check_usa_hooks_da_policy(trilha):
     report = hooks.check(pol, audit_path=trilha)
     assert report.verdict == "pass"
     assert report.results[0].nome == "ok"
+    assert report.results[0].timeout_s == pol.verificacao.timeout_s
+    assert report.results[0].timeout_origin == "policy"
+    assert report.results[0].governing_field == "verificacao.timeout_s"
+    registro = _linhas(trilha)[-1]
+    assert registro["timeout_origin"] == "policy"
+    assert registro["governing_field"] == "verificacao.timeout_s"
+
+
+def test_check_override_explicito_vence_politica_sem_declarar_governanca(trilha):
+    import dataclasses
+
+    from fpch import policy
+
+    pol = dataclasses.replace(
+        policy._default(),
+        verificacao=policy.VerificacaoBlock(timeout_s=1),
+        hooks=(_hook(nome="ok", cmd=_py("import sys; sys.exit(0)"), criterio="exit_zero"),),
+    )
+    report = hooks.check(pol, timeout_s=2, audit_path=trilha)
+
+    assert report.results[0].timeout_s == 2
+    assert report.results[0].timeout_origin == "explicit"
+    assert report.results[0].governing_field is None
+    registro = _linhas(trilha)[-1]
+    assert registro["timeout_s"] == 2
+    assert registro["timeout_origin"] == "explicit"
+    assert "governing_field" not in registro
+
+
+@pytest.mark.parametrize("valor", [0, -1, math.inf, math.nan])
+def test_timeout_invalido_falha_antes_de_executar(valor, trilha):
+    h = _hook(cmd=_py("import sys; sys.exit(0)"), criterio="exit_zero")
+    with pytest.raises(ValueError, match="positivo e finito"):
+        hooks.run_hook(h, timeout_s=valor, audit_path=trilha)
+    assert _linhas(trilha) == []
 
 
 def test_emitir_false_nao_escreve_na_trilha(trilha):

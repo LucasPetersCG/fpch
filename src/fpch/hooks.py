@@ -52,6 +52,7 @@ comparada — jamais interpretada.
 
 from __future__ import annotations
 
+import math
 import subprocess
 import uuid
 from dataclasses import dataclass, field
@@ -108,6 +109,10 @@ class HookResult:
     cause_category: str | None = None   # só quando há base objetiva
     cause_subtype: str | None = None    # só válido dentro de cause_category
     fault_side: str | None = None       # "infraestrutura" nas reprovações
+    timed_out: bool = False             # só True quando subprocess.TimeoutExpired ocorreu
+    timeout_s: float = DEFAULT_TIMEOUT_S
+    timeout_origin: str = "explicit"
+    governing_field: str | None = None
     #: A trilha aceitou o evento? `audit.write` devolve bool justamente para que
     #: a perda não seja invisível; propagar aqui é o que permite ao chamador
     #: saber que rodou a verificação mas não a registrou.
@@ -197,7 +202,9 @@ def _avalia(criterio: str, code: int, saida: str) -> tuple[str, str]:
     )
 
 
-def _executa(cmd: list[str], cwd: Path, timeout_s: float) -> tuple[str, str, int | None, str | None]:
+def _executa(
+    cmd: list[str], cwd: Path, timeout_s: float,
+) -> tuple[str, str, int | None, str | None, bool]:
     """Roda o comando. Devolve `(estado, evidence_ou_saida, exit_code, cause_subtype)`.
 
     `estado` é `"ok"` quando o processo rodou até o fim (aí o segundo item é a
@@ -231,6 +238,7 @@ def _executa(cmd: list[str], cwd: Path, timeout_s: float) -> tuple[str, str, int
             "sem veredito, isto é reprovação e não aprovação",
             None,
             "bloqueio_de_ambiente",
+            True,
         )
     except FileNotFoundError:
         return (
@@ -239,6 +247,7 @@ def _executa(cmd: list[str], cwd: Path, timeout_s: float) -> tuple[str, str, int
             "hook declarado mas não executável não é hook que passou",
             None,
             "bloqueio_de_ambiente",
+            False,
         )
     except (PermissionError, NotADirectoryError, OSError) as exc:
         return (
@@ -246,6 +255,7 @@ def _executa(cmd: list[str], cwd: Path, timeout_s: float) -> tuple[str, str, int
             f"o sistema operacional recusou a execução de {cmd[0]!r}: {exc}",
             None,
             "outro",
+            False,
         )
 
     saida = (proc.stdout or "").strip()
@@ -254,7 +264,7 @@ def _executa(cmd: list[str], cwd: Path, timeout_s: float) -> tuple[str, str, int
         # stderr conta como saída: um hook cujo critério é `saida_vazia` e que
         # despeja aviso em stderr não está silencioso, está reclamando.
         saida = f"{saida}\n{erro}".strip()
-    return "ok", saida, proc.returncode, None
+    return "ok", saida, proc.returncode, None, False
 
 
 def run_hook(
@@ -262,6 +272,8 @@ def run_hook(
     *,
     cwd: Path | str | None = None,
     timeout_s: float = DEFAULT_TIMEOUT_S,
+    timeout_origin: str = "explicit",
+    governing_field: str | None = None,
     trajectory_id: str | None = None,
     audit_path: Path | None = None,
     label: str | None = None,
@@ -277,6 +289,13 @@ def run_hook(
     (a Fase 5 relendo uma proposta, por exemplo). O padrão é emitir: a seção 6 da
     spec é explícita em que esta é a primeira vez que um validador deixa rastro.
     """
+    if (
+        isinstance(timeout_s, bool)
+        or not isinstance(timeout_s, (int, float))
+        or not math.isfinite(float(timeout_s))
+        or timeout_s <= 0
+    ):
+        raise ValueError("timeout_s deve ser número positivo e finito")
     destino = Path(cwd) if cwd is not None else Path.cwd()
     tid = trajectory_id or f"hook-{uuid.uuid4().hex[:12]}"
     criterio = (hook.criterio or "").strip()
@@ -286,6 +305,7 @@ def run_hook(
     cause_subtype: str | None = None
     lado: str | None = None
     exit_code: int | None = None
+    timed_out = False
     inicio = _monotonic()
 
     if criterio not in CRITERIOS:
@@ -303,7 +323,7 @@ def run_hook(
             "não há o que executar, logo não há o que aprovar"
         )
     else:
-        estado, bruto, exit_code, subtipo_exec = _executa(cmd, destino, timeout_s)
+        estado, bruto, exit_code, subtipo_exec, timed_out = _executa(cmd, destino, timeout_s)
         if estado == "erro":
             verdict, evidence = "fail", _truncate(bruto)
             if subtipo_exec is not None:
@@ -346,6 +366,10 @@ def run_hook(
                 # pytest" — ver a nota de `Event.source_ref` em audit.py.
                 source="hook",
                 source_ref=hook.nome,
+                timed_out=timed_out,
+                timeout_s=timeout_s,
+                timeout_origin=timeout_origin,
+                governing_field=governing_field,
             ),
             path=audit_path,
         )
@@ -360,6 +384,10 @@ def run_hook(
         cause_category=cause,
         cause_subtype=cause_subtype,
         fault_side=lado,
+        timed_out=timed_out,
+        timeout_s=timeout_s,
+        timeout_origin=timeout_origin,
+        governing_field=governing_field,
         trilha_ok=trilha_ok,
     )
 
@@ -370,6 +398,8 @@ def run_all(
     quando: str | None = QUANDO_SEMPRE,
     cwd: Path | str | None = None,
     timeout_s: float = DEFAULT_TIMEOUT_S,
+    timeout_origin: str = "explicit",
+    governing_field: str | None = None,
     trajectory_id: str | None = None,
     audit_path: Path | None = None,
     label: str | None = None,
@@ -394,6 +424,8 @@ def run_all(
             h,
             cwd=cwd,
             timeout_s=timeout_s,
+            timeout_origin=timeout_origin,
+            governing_field=governing_field,
             trajectory_id=tid,
             audit_path=audit_path,
             label=label,
@@ -423,7 +455,7 @@ def check(
     *,
     quando: str | None = QUANDO_SEMPRE,
     cwd: Path | str | None = None,
-    timeout_s: float = DEFAULT_TIMEOUT_S,
+    timeout_s: float | None = None,
     trajectory_id: str | None = None,
     audit_path: Path | None = None,
     label: str | None = None,
@@ -434,11 +466,22 @@ def check(
     `--policy`) é a CLI, e um `policy.load()` escondido aqui dentro faria a
     verificação rodar com uma política diferente da que a CLI acabou de exibir.
     """
+    if timeout_s is None:
+        timeout_efetivo = float(policy.verificacao.timeout_s)
+        timeout_origin = "policy"
+        governing_field = "verificacao.timeout_s"
+    else:
+        timeout_efetivo = timeout_s
+        timeout_origin = "explicit"
+        governing_field = None
+
     return run_all(
         policy.hooks,
         quando=quando,
         cwd=cwd,
-        timeout_s=timeout_s,
+        timeout_s=timeout_efetivo,
+        timeout_origin=timeout_origin,
+        governing_field=governing_field,
         trajectory_id=trajectory_id,
         audit_path=audit_path,
         label=label,

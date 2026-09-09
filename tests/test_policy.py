@@ -23,7 +23,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from fpch import models, policy  # noqa: E402
+from fpch import audit, models, policy  # noqa: E402
 
 
 @pytest.fixture(autouse=True)
@@ -55,6 +55,7 @@ def test_ausencia_de_arquivo_devolve_default_sem_erro(_isola_cascata):
     assert pol.fonte == "default embutido"
     assert pol.escalada.max_escalations == 2
     assert pol.backends.timeout_s == 600
+    assert pol.verificacao.timeout_s == 120
     assert all(v == "default embutido" for v in pol.origem.values())
 
 
@@ -146,6 +147,38 @@ def test_valor_de_tipo_errado_levanta_erro(_isola_cascata):
     _escreve(projeto / "fpch.policy.toml", '[escalada]\nmax_escalations = "dois"\n')
 
     with pytest.raises(policy.PolicyError, match="max_escalations"):
+        policy.load()
+
+
+@pytest.mark.parametrize("valor", [0, -1])
+def test_timeout_de_verificacao_deve_ser_positivo(_isola_cascata, valor):
+    projeto = _isola_cascata["projeto"]
+    _escreve(projeto / "fpch.policy.toml", f"[verificacao]\ntimeout_s = {valor}\n")
+
+    with pytest.raises(policy.PolicyError, match="verificacao.timeout_s"):
+        policy.load()
+
+
+def test_verificacao_carrega_valor_e_origem(_isola_cascata):
+    projeto = _isola_cascata["projeto"]
+    _escreve(projeto / "fpch.policy.toml", "[verificacao]\ntimeout_s = 2\n")
+
+    pol = policy.load()
+
+    assert pol.verificacao.timeout_s == 2
+    assert "arquivo do projeto" in pol.origem["verificacao"]
+
+
+def test_causa_raiz_deriva_da_taxonomia_e_nao_e_externalizavel(_isola_cascata):
+    pol = policy.load()
+    assert pol.causa_raiz.categorias == tuple(audit.CAUSE_TAXONOMY)
+    assert pol.causa_raiz.subtipos == tuple(
+        subtipo for subtipos in audit.CAUSE_TAXONOMY.values() for subtipo in subtipos
+    )
+
+    projeto = _isola_cascata["projeto"]
+    _escreve(projeto / "fpch.policy.toml", '[causa_raiz]\ncategorias = ["inventada"]\n')
+    with pytest.raises(policy.PolicyError, match="causa_raiz"):
         policy.load()
 
 
@@ -253,7 +286,10 @@ def test_dump_mostra_origem_default(_isola_cascata):
     saida = policy.dump(pol)
     assert "[escalada] (origem: default embutido)" in saida
     assert "max_escalations = 2" in saida
-    # os quatro blocos imutáveis aparecem, listados à parte.
+    assert "[verificacao] (origem: default embutido)" in saida
+    assert "timeout_s = 120" in saida
+    # os blocos imutáveis aparecem, listados à parte.
+    assert "taxonomia_de_causa_raiz" in saida
     assert "regras_de_proveniencia" in saida
     assert "clausula_anti_injecao" in saida
     assert "padroes_de_contencao" in saida

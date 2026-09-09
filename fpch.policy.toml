@@ -39,6 +39,10 @@ timeout_s = 600
 # `backends.py::_stage_prompt`.
 arg_limit = 24000
 
+[verificacao]
+# Segundos antes de interromper cada hook determinístico de `fpch check`.
+timeout_s = 120
+
 [falha]
 # Resposta mais curta que isto (em caracteres) é tratada como recusa ou
 # saudação, não como trabalho de fato feito.
@@ -156,32 +160,22 @@ cmd = ["uv", "run", "--with", "pytest", "pytest", "-q"]
 quando = "sempre"
 criterio = "exit_zero"
 
-[causa_raiz]
-categorias = ["epistemica", "competencia", "ambiente"]
-# Lista provisória — ver o comentário em `policy.py::CausaRaizBlock`.
-subtipos = [
-    "timeout",
-    "quota_excedida",
-    "resposta_vazia",
-    "assinatura_de_falha",
-    "erro_de_ambiente",
-    "outro",
-]
-
 # ---------------------------------------------------------------------------
 # O QUE NÃO ESTÁ AQUI, E POR QUÊ
 #
-# Quatro blocos são deliberadamente NÃO-externalizáveis — não existe uma
+# Cinco blocos são deliberadamente NÃO-externalizáveis — não existe uma
 # tabela TOML para eles, em nenhum nível da cascata, porque cada um É a
 # própria defesa contra o conteúdo hostil que a canibalização assume como
 # premissa (cannibalize.py:17-27). Um arquivo gravável entregaria essa defesa
 # a um agente que corre com permissão de escrita — o anti-padrão que o TCC
 # condena ao citar Rashidi.
 #
-#   1. Regras de proveniência       — cannibalize.py:173-205
-#   2. Cláusula anti-injeção        — cannibalize.py:208-247
-#   3. Padrões de contenção         — backends.py:128-129
-#   4. Portão de aprovação humana   — cli.py:213-219 (cannibalize.run() ainda
+#   1. Taxonomia de causa raiz      — audit.py::CAUSE_TAXONOMY (mecanismo cuja
+#                                      edição mudaria o significado da trilha)
+#   2. Regras de proveniência       — cannibalize.py:173-205
+#   3. Cláusula anti-injeção        — cannibalize.py:208-247
+#   4. Padrões de contenção         — backends.py:128-129
+#   5. Portão de aprovação humana   — cli.py:213-219 (cannibalize.run() ainda
 #                                      não confere target.status; ver Onda 2C)
 #
 # Ver `IMMUTABLE_BLOCKS` em `src/fpch/policy.py` para a razão de cada um por

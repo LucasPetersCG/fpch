@@ -518,7 +518,7 @@ def test_adulteracao_de_annotate_e_detectada(trilha):
 
 
 # --------------------------------------------------------------------------
-# Compatibilidade de leitura: esquemas 1 e 2
+# Compatibilidade de leitura: esquemas 1, 2 e 3
 # --------------------------------------------------------------------------
 
 def _linha_v2(**kw) -> str:
@@ -542,6 +542,11 @@ def _linha_v2(**kw) -> str:
     return json.dumps(base, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
 
 
+def _linha_v3(**kw) -> str:
+    """Evento mínimo do esquema anterior, para provar leitura retrocompatível."""
+    return _linha_v2(schema_version=3, trajectory_id="t-esquema-3", **kw)
+
+
 def test_linha_de_esquema_2_continua_legivel_e_encadeavel(trilha):
     trilha.write_text(_linha_v2() + "\n", encoding="utf-8")
 
@@ -551,23 +556,28 @@ def test_linha_de_esquema_2_continua_legivel_e_encadeavel(trilha):
     assert audit.verify_chain(trilha) == (True, None)
     assert audit.counters()["unknown_vocab"] == 0
 
-    # E o esquema 3 continua a cadeia a partir dela, sem reescrever nada.
+    # E o esquema atual continua a cadeia a partir dela, sem reescrever nada.
     audit.write(_evento(1, tid="t-antiga", model="novo"), trilha)
     linhas = _linhas(trilha)
     assert linhas[0]["schema_version"] == 2
-    assert linhas[1]["schema_version"] == audit.SCHEMA_VERSION == 3
+    assert linhas[1]["schema_version"] == audit.SCHEMA_VERSION == 4
     assert linhas[1]["prev_hash"] == linhas[0]["hash"]
     assert audit.verify_chain(trilha) == (True, None)
 
 
-def test_esquemas_1_2_e_3_convivem_na_mesma_trilha(trilha):
-    trilha.write_text(_linha_v1(label="antigo") + "\n" + _linha_v2() + "\n", encoding="utf-8")
+def test_esquemas_1_2_3_e_4_convivem_na_mesma_trilha(trilha):
+    linha_v2 = _linha_v2()
+    linha_v3 = _linha_v3(prev_hash=json.loads(linha_v2)["hash"])
+    trilha.write_text(
+        _linha_v1(label="antigo") + "\n" + linha_v2 + "\n" + linha_v3 + "\n",
+        encoding="utf-8",
+    )
     audit.write(_evento(0, tid="nova", model="m"), trilha)
 
     rows = audit.read_all(trilha)
-    assert {r["schema_version"] for r in rows} == {1, 2, 3}
+    assert {r["schema_version"] for r in rows} == {1, 2, 3, 4}
     assert audit.verify_chain(trilha) == (True, None)
-    assert audit.summary(trilha)["total_calls"] == 3
+    assert audit.summary(trilha)["total_calls"] == 4
 
 
 # --------------------------------------------------------------------------

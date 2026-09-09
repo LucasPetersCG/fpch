@@ -55,6 +55,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 import re
 import uuid
@@ -69,12 +70,15 @@ from .policy import IMMUTABLE_BLOCKS, Policy
 #: futura é recusada em vez de reinterpretada — adivinhar o formato de um arquivo
 #: que autoriza escrita na política seria trocar o portão por um palpite.
 PROPOSTA_SCHEMA = 1
+_PROPOSTA_ID_RE = re.compile(r"prop-[0-9a-f]{12}\Z")
 
 #: Blocos que a seção 5.2 declara externalizáveis. Espelha à mão os campos de
 #: `policy.Policy` (menos `origem` e `fonte`, que são metadados de carga, não
 #: política). `tests/test_improve.py::test_blocos_externalizaveis_espelham_policy`
 #: é quem impede este espelho de divergir.
-BLOCOS_EXTERNALIZAVEIS = ("meta", "escalada", "backends", "falha", "modelos", "hooks", "causa_raiz")
+BLOCOS_EXTERNALIZAVEIS = (
+    "meta", "escalada", "backends", "verificacao", "falha", "modelos", "hooks",
+)
 
 #: Nomes dos blocos que a seção 5.3 proíbe externalizar. Vêm de `policy`, não de
 #: uma cópia: se a lista de lá crescer, o portão daqui cresce junto.
@@ -105,6 +109,8 @@ RECUSA_BLOCO_INEXISTENTE = "bloco_nao_externalizavel"
 RECUSA_TRAJETORIA_AUSENTE = "trajetoria_ausente"
 RECUSA_VALOR_DIVERGENTE = "valor_atual_divergente"
 RECUSA_POLITICA_INVALIDA = "politica_invalida"
+RECUSA_CAMPO_NAO_GOVERNA = "campo_nao_governa_o_componente"  # condição (d)
+RECUSA_PROPOSTA_DIVERGENTE = "proposta_divergente_da_evidencia"
 
 
 def _agora_iso() -> str:
@@ -134,22 +140,31 @@ class Regra:
     """
 
     nome: str
-    bloco: str
-    campo: str
     gatilhos: tuple[str, ...]
+    # origem estrutural do evento -> (bloco, campo) que governa seu produtor.
+    # Ausência é recusa fechada; texto da evidência nunca inventa uma origem.
+    governanca: tuple[tuple[str, str, str], ...]
+
+    def alvo_para(self, origem: str) -> tuple[str, str] | None:
+        for origem_regra, bloco, campo in self.governanca:
+            if origem_regra == origem:
+                return bloco, campo
+        return None
 
 
 REGRA_TIMEOUT = Regra(
     nome="ampliar_timeout",
-    bloco="backends",
-    campo="timeout_s",
     gatilhos=("timeout", "estourou o tempo", "timed out"),
+    governanca=(("hook", "verificacao", "timeout_s"),),
 )
+# O alvo causal de uma chamada a modelo é [backends].timeout_s. Ele não entra no
+# mapa executável ainda: router emite `attempt`, enquanto improve só admite
+# `verify/fail`, e não existe hoje produtor com provenance tipada compatível.
+# Quando esse produtor existir, sua origem fechada poderá mapear para esse par.
+ALVO_TIMEOUT_MODELO_PENDENTE = ("backends", "timeout_s")
 
 REGRA_ASSINATURA = Regra(
     nome="reconhecer_assinatura_de_falha",
-    bloco="falha",
-    campo="assinaturas",
     gatilhos=(
         "no output produced",
         "auto-denied",
@@ -157,6 +172,9 @@ REGRA_ASSINATURA = Regra(
         "rate limit exceeded",
         "ineligibletiererror",
     ),
+    # Ainda não existe produtor de evento compatível que prove que
+    # [falha].assinaturas governou a chamada. Hook jamais pode alterar este campo.
+    governanca=(),
 )
 
 REGRAS: tuple[Regra, ...] = (REGRA_TIMEOUT, REGRA_ASSINATURA)
@@ -352,35 +370,60 @@ def _candidatos(trilha: Path | None) -> list[dict]:
     return vistos
 
 
-def _valor_atual(pol: Policy, regra: Regra) -> object:
-    bloco = getattr(pol, regra.bloco)
-    return getattr(bloco, regra.campo)
+def _valor_atual(pol: Policy, bloco: str, campo: str) -> object:
+    return getattr(getattr(pol, bloco), campo)
 
 
-def _proposta_de(regra: Regra, gatilho: str, ev: dict, pol: Policy) -> tuple[Proposta | None, Recusa | None]:
+def _metadados_hook(ev: dict) -> dict | None:
+    """Valida a proveniência tipada do schema vigente, sem heurística textual."""
+    if (
+        ev.get("source") != "hook"
+        or ev.get("source_ref") != ev.get("component")
+        or not isinstance(ev.get("schema_version"), int)
+        or ev["schema_version"] != audit.SCHEMA_VERSION
+    ):
+        return None
+    if type(ev.get("timed_out")) is not bool:
+        return None
+    timeout_s = ev.get("timeout_s")
+    if (
+        isinstance(timeout_s, bool)
+        or not isinstance(timeout_s, (int, float))
+        or not math.isfinite(float(timeout_s))
+        or timeout_s <= 0
+    ):
+        return None
+    if ev.get("timeout_origin") not in audit.TIMEOUT_ORIGINS:
+        return None
+    return ev
+
+
+def _proposta_de(
+    regra: Regra, gatilho: str, ev: dict, pol: Policy, bloco: str, campo: str,
+) -> tuple[Proposta | None, Recusa | None]:
     """Materializa a alteração de uma regra, ou explica por que não há alteração."""
     tid = str(ev.get("trajectory_id") or "")
     comp = str(ev.get("component") or "?")
     evidence = str(ev.get("evidence") or "")
-    atual = _valor_atual(pol, regra)
+    atual = _valor_atual(pol, bloco, campo)
 
     if regra is REGRA_TIMEOUT:
         if not isinstance(atual, int) or atual >= TETO_TIMEOUT_S:
             return None, Recusa(
                 RECUSA_SEM_MUDANCA,
-                f"[backends].timeout_s já está em {atual}s, no teto de {TETO_TIMEOUT_S}s que este "
+                f"[{bloco}].{campo} já está em {atual}s, no teto de {TETO_TIMEOUT_S}s que este "
                 "laço pode pedir. Um teto maior é decisão do autor, não do laço.",
                 tid, comp, regra.nome,
             )
         proposto = min(atual * 2, TETO_TIMEOUT_S)
         justificativa = (
-            f"O hook {comp!r} reprovou por estouro de tempo (gatilho {gatilho!r} na evidência), com "
-            f"`fault_side=infraestrutura`. O teto vigente de {atual}s é política externalizável "
-            "([backends].timeout_s, seção 5.2), então esta é uma falta que um documento de política "
+            f"O hook {comp!r} reprovou por estouro de tempo real, com "
+            f"`fault_side=infraestrutura`. O teto efetivo de {atual}s veio da política "
+            f"([{bloco}].{campo}), então esta é uma falta que esse documento de política "
             "de fato pode corrigir."
         )
         remocao = (
-            f"Reverter [backends].timeout_s para {atual} assim que 5 execuções consecutivas de "
+            f"Reverter [{bloco}].{campo} para {atual} assim que 5 execuções consecutivas de "
             f"{comp!r} concluírem abaixo de {atual}s. O critério é conferível na própria trilha: "
             "todo evento carrega `latency_s`, e nenhuma instrumentação nova é necessária para "
             "decidir a remoção."
@@ -420,8 +463,8 @@ def _proposta_de(regra: Regra, gatilho: str, ev: dict, pol: Policy) -> tuple[Pro
         evidence=evidence,
         regra=regra.nome,
         gatilho=gatilho,
-        bloco=regra.bloco,
-        campo=regra.campo,
+        bloco=bloco,
+        campo=campo,
         valor_atual=atual,
         valor_proposto=proposto,
         justificativa=justificativa,
@@ -433,7 +476,7 @@ def _proposta_de(regra: Regra, gatilho: str, ev: dict, pol: Policy) -> tuple[Pro
 
 def _diagnostica(ev: dict, pol: Policy, integras: set[str], quebra: int | None
                  ) -> tuple[Proposta | None, Recusa | None]:
-    """Aplica as três condições, nesta ordem, a um candidato."""
+    """Aplica as quatro condições, nesta ordem, a um candidato."""
     tid = str(ev.get("trajectory_id") or "")
     comp = str(ev.get("component") or "?")
     evidence = str(ev.get("evidence") or "").strip()
@@ -482,7 +525,39 @@ def _diagnostica(ev: dict, pol: Policy, integras: set[str], quebra: int | None
         )
 
     regra, gatilho = casada
-    return _proposta_de(regra, gatilho, ev, pol)
+    origem = str(ev.get("source") or "")
+    alvo = regra.alvo_para(origem)
+    if alvo is None:
+        return None, Recusa(
+            RECUSA_CAMPO_NAO_GOVERNA,
+            f"condição (d) ausente: a regra {regra.nome!r} não declara campo de política que "
+            f"governe a origem estrutural {origem!r}. Texto da evidência não cria governança; "
+            "sem produtor compatível a proposta falha fechada.",
+            tid, comp, regra.nome,
+        )
+
+    bloco, campo = alvo
+    atual = _valor_atual(pol, bloco, campo)
+
+    if regra is REGRA_TIMEOUT and origem == "hook":
+        meta = _metadados_hook(ev)
+        campo_qualificado = f"{bloco}.{campo}"
+        if (
+            meta is None
+            or meta.get("timed_out") is not True
+            or meta.get("timeout_origin") != "policy"
+            or meta.get("governing_field") != campo_qualificado
+            or _normaliza(meta.get("timeout_s")) != _normaliza(atual)
+        ):
+            return None, Recusa(
+                RECUSA_CAMPO_NAO_GOVERNA,
+                f"condição (d) ausente: o evento do hook não prova simultaneamente timeout real, "
+                f"origem policy, governing_field={campo_qualificado!r} e timeout efetivo igual ao "
+                f"valor vigente {atual!r}. `bloqueio_de_ambiente` e a palavra 'timeout' não bastam.",
+                tid, comp, regra.nome,
+            )
+
+    return _proposta_de(regra, gatilho, ev, pol, bloco, campo)
 
 
 # ---------------------------------------------------------------------------
@@ -542,8 +617,12 @@ def salvar(proposta: Proposta, *, propostas_dir: Path | None = None) -> Path:
 
 
 def carregar(proposta_id: str, *, propostas_dir: Path | None = None) -> dict | None:
-    destino = propostas_dir or _propostas_dir_padrao()
-    caminho = destino / f"{proposta_id}.json"
+    if _PROPOSTA_ID_RE.fullmatch(proposta_id) is None:
+        return None
+    destino = (propostas_dir or _propostas_dir_padrao()).resolve()
+    caminho = (destino / f"{proposta_id}.json").resolve()
+    if caminho.parent != destino:
+        return None
     if not caminho.exists():
         return None
     try:
@@ -725,6 +804,18 @@ def aplicar(proposta_id: str, *, policy_path: Path, trilha: Path | None = None,
             proposta_id, "", "", trilha=trilha, uso=True,
         )
 
+    if dados.get("id") != proposta_id:
+        return _recusa_aplicacao(
+            RECUSA_PROPOSTA_DIVERGENTE,
+            f"o id interno {dados.get('id')!r} não coincide com o arquivo pedido "
+            f"{proposta_id!r}; proposta adulterada não autoriza escrita.",
+            proposta_id,
+            str(dados.get("trajectory_id") or ""),
+            str(dados.get("component") or ""),
+            trilha=trilha,
+            regra=dados.get("regra"),
+        )
+
     tid = str(dados.get("trajectory_id") or "")
     comp = str(dados.get("component") or "")
 
@@ -766,6 +857,24 @@ def aplicar(proposta_id: str, *, policy_path: Path, trilha: Path | None = None,
             proposta_id, tid, comp, trilha=trilha, regra=dados.get("regra"),
         )
 
+    evidencia = str(dados.get("evidence") or "")
+    eventos_exatos = [
+        ev for ev in eventos
+        if ev.get("event") == "verify"
+        and ev.get("verdict") == "fail"
+        and str(ev.get("trajectory_id") or "") == tid
+        and str(ev.get("component") or "") == comp
+        and str(ev.get("evidence") or "") == evidencia
+    ]
+    if not eventos_exatos:
+        return _recusa_aplicacao(
+            RECUSA_PROPOSTA_DIVERGENTE,
+            "a trilha íntegra não contém o evento verify/fail exato citado pela proposta "
+            "(trajetória, componente e evidência). O JSON da proposta é mutável e não pode "
+            "substituir a evidência original.",
+            proposta_id, tid, comp, trilha=trilha, regra=dados.get("regra"),
+        )
+
     integras, quebra = trajetorias_integras(trilha)
     if tid not in integras:
         return _recusa_aplicacao(
@@ -803,6 +912,53 @@ def aplicar(proposta_id: str, *, policy_path: Path, trilha: Path | None = None,
             RECUSA_VALOR_DIVERGENTE,
             f"{bloco}.{campo} vale {vigente!r} hoje, mas a proposta foi calculada sobre "
             f"{esperado!r}. A política mudou desde a análise; refaça `fpch improve`.",
+            proposta_id, tid, comp, trilha=trilha, regra=dados.get("regra"),
+        )
+
+    # A proposta em disco não é autoridade. Reexecuta o mesmo diagnóstico sobre
+    # o evento exato da trilha íntegra e a política atual; isto revalida regra,
+    # gatilho, governança, alvo e os dois valores inclusive para propostas antigas.
+    rederivadas: list[Proposta] = []
+    recusas_rederivacao: list[Recusa] = []
+    for ev in eventos_exatos:
+        rederivada, recusa = _diagnostica(ev, pol_atual, integras, quebra)
+        if rederivada is not None:
+            rederivadas.append(rederivada)
+        elif recusa is not None:
+            recusas_rederivacao.append(recusa)
+
+    if not rederivadas:
+        recusa = recusas_rederivacao[0] if recusas_rederivacao else Recusa(
+            RECUSA_PROPOSTA_DIVERGENTE,
+            "o evento citado não rederiva proposta válida sob a política atual.",
+            tid, comp,
+        )
+        return _recusa_aplicacao(
+            recusa.codigo,
+            f"a proposta não atravessa a revalidação atual: {recusa.mensagem}",
+            proposta_id, tid, comp, trilha=trilha, regra=recusa.regra,
+        )
+
+    campos_rederivados = (
+        "id", "trajectory_id", "component", "evidence", "regra", "gatilho",
+        "bloco", "campo", "valor_atual", "valor_proposto", "justificativa",
+        "remocao", "fault_side", "cause_category",
+    )
+    rederivada = next(
+        (
+            candidata for candidata in rederivadas
+            if all(
+                _normaliza(dados.get(nome)) == _normaliza(getattr(candidata, nome))
+                for nome in campos_rederivados
+            )
+        ),
+        None,
+    )
+    if rederivada is None or dados.get("status") != "proposta":
+        return _recusa_aplicacao(
+            RECUSA_PROPOSTA_DIVERGENTE,
+            "regra, gatilho, governança, campo ou valores do JSON não coincidem com o que o "
+            "evento íntegro e a política atual rederivam. A proposta pode ter sido adulterada.",
             proposta_id, tid, comp, trilha=trilha, regra=dados.get("regra"),
         )
 

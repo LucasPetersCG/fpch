@@ -50,6 +50,13 @@ import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
 
+# `audit` é o único módulo do FPCH importado daqui, e a direção é segura: ele
+# depende apenas da biblioteca padrão, então `policy → audit` não fecha ciclo
+# nenhum (o docstring acima explica por que `models` continua de fora). O motivo
+# do import é `CAUSE_TAXONOMY`: a taxonomia de causa raiz tem **uma** fonte, e é
+# lá — ver `CausaRaizBlock`.
+from .audit import CAUSE_TAXONOMY
+
 # --------------------------------------------------------------------------
 # Conjuntos válidos, espelhados à mão de `models.py` (Pool e TaskClass).
 #
@@ -93,6 +100,13 @@ class BackendsBlock:
 
 
 @dataclass(frozen=True)
+class VerificacaoBlock:
+    """Limites que governam os hooks determinísticos executados por ``fpch check``."""
+
+    timeout_s: int = 120
+
+
+@dataclass(frozen=True)
 class FalhaBlock:
     min_chars: int = 40
     assinaturas: tuple[str, ...] = (
@@ -132,18 +146,13 @@ class HookEntry:
 
 @dataclass(frozen=True)
 class CausaRaizBlock:
-    categorias: tuple[str, ...] = ("epistemica", "competencia", "ambiente")
-    # Lista provisória: a spec (seção 2) só fixa as três categorias de Zhao et
-    # al.; o subtipo livre e sua lista fechada ficam para quem instanciar o
-    # diagnóstico de fato (Fase 1 / audit.py). Sobrescrever em arquivo é o
-    # caminho esperado assim que essa lista for decidida.
-    subtipos: tuple[str, ...] = (
-        "timeout",
-        "quota_excedida",
-        "resposta_vazia",
-        "assinatura_de_falha",
-        "erro_de_ambiente",
-        "outro",
+    """Espelho somente leitura da taxonomia canônica mantida em ``audit.py``."""
+
+    categorias: tuple[str, ...] = tuple(CAUSE_TAXONOMY)
+    subtipos: tuple[str, ...] = tuple(
+        subtipo
+        for subtipos_da_categoria in CAUSE_TAXONOMY.values()
+        for subtipo in subtipos_da_categoria
     )
 
 
@@ -157,6 +166,14 @@ class ImmutableBlock:
 
 
 IMMUTABLE_BLOCKS: tuple[ImmutableBlock, ...] = (
+    ImmutableBlock(
+        nome="taxonomia_de_causa_raiz",
+        razao=(
+            "A taxonomia define o significado dos números da trilha. Ela é mecanismo, "
+            "derivado de audit.CAUSE_TAXONOMY, e não pode ser redefinida por política."
+        ),
+        referencia="audit.py::CAUSE_TAXONOMY",
+    ),
     ImmutableBlock(
         nome="regras_de_proveniencia",
         razao=(
@@ -208,6 +225,7 @@ class Policy:
     meta: MetaBlock
     escalada: EscaladaBlock
     backends: BackendsBlock
+    verificacao: VerificacaoBlock
     falha: FalhaBlock
     modelos: tuple[ModelEntry, ...]
     hooks: tuple[HookEntry, ...]
@@ -264,7 +282,7 @@ _DEFAULT_MODELS: tuple[ModelEntry, ...] = (
 # operador, em arquivo dele. Ver a §5.3 do contrato da fatia funcional.
 _DEFAULT_HOOKS: tuple[HookEntry, ...] = ()
 
-_TODOS_BLOCOS = ("meta", "escalada", "backends", "falha", "modelos", "hooks", "causa_raiz")
+_TODOS_BLOCOS = ("meta", "escalada", "backends", "verificacao", "falha", "modelos", "hooks")
 
 
 def _default() -> Policy:
@@ -272,6 +290,7 @@ def _default() -> Policy:
         meta=MetaBlock(),
         escalada=EscaladaBlock(),
         backends=BackendsBlock(),
+        verificacao=VerificacaoBlock(),
         falha=FalhaBlock(),
         modelos=_DEFAULT_MODELS,
         hooks=_DEFAULT_HOOKS,
@@ -329,6 +348,13 @@ def _resolve_source(cli_path: str | Path | None) -> tuple[Path | None, str, bool
 # --------------------------------------------------------------------------
 
 def _valida_tipo(valor: object, tipo: type | str, campo: str, caminho: Path) -> object:
+    if tipo == "positive_int":
+        if type(valor) is not int or valor <= 0:
+            raise PolicyError(
+                f"valor inválido para '{campo}' em {caminho}: "
+                "esperado inteiro positivo"
+            )
+        return valor
     if tipo is int:
         # bool é subclasse de int em Python — sem esta checa, `true` no TOML
         # passaria como inteiro válido.
@@ -387,15 +413,13 @@ _CAMPOS_BACKENDS = {
     "timeout_s": (int, 600),
     "arg_limit": (int, 24_000),
 }
+_CAMPOS_VERIFICACAO = {
+    "timeout_s": ("positive_int", 120),
+}
 _CAMPOS_FALHA = {
     "min_chars": (int, 40),
     "assinaturas": ("list_str", FalhaBlock().assinaturas),
 }
-_CAMPOS_CAUSA_RAIZ = {
-    "categorias": ("list_str", CausaRaizBlock().categorias),
-    "subtipos": ("list_str", CausaRaizBlock().subtipos),
-}
-
 _CAMPOS_MODELO = {
     "id": (str, None),
     "backend": (str, None),
@@ -542,25 +566,25 @@ def load(cli_path: str | Path | None = None) -> Policy:
         BackendsBlock(**_extrai_tabela(dados, "backends", _CAMPOS_BACKENDS, caminho))
         if "backends" in dados else default.backends
     )
+    verificacao = (
+        VerificacaoBlock(**_extrai_tabela(dados, "verificacao", _CAMPOS_VERIFICACAO, caminho))
+        if "verificacao" in dados else default.verificacao
+    )
     falha = (
         FalhaBlock(**_extrai_tabela(dados, "falha", _CAMPOS_FALHA, caminho))
         if "falha" in dados else default.falha
     )
     modelos = _bloco_modelos(dados, caminho) if "modelos" in dados else default.modelos
     hooks = _bloco_hooks(dados, caminho) if "hooks" in dados else default.hooks
-    causa_raiz = (
-        CausaRaizBlock(**_extrai_tabela(dados, "causa_raiz", _CAMPOS_CAUSA_RAIZ, caminho))
-        if "causa_raiz" in dados else default.causa_raiz
-    )
-
     return Policy(
         meta=meta,
         escalada=escalada,
         backends=backends_bloco,
+        verificacao=verificacao,
         falha=falha,
         modelos=modelos,
         hooks=hooks,
-        causa_raiz=causa_raiz,
+        causa_raiz=default.causa_raiz,
         origem=origem,
         fonte=origem_label,
     )
@@ -593,6 +617,9 @@ def dump(policy: Policy) -> str:
         "timeout_s": policy.backends.timeout_s,
         "arg_limit": policy.backends.arg_limit,
     })
+    bloco("verificacao", {
+        "timeout_s": policy.verificacao.timeout_s,
+    })
     bloco("falha", {
         "min_chars": policy.falha.min_chars,
         "assinaturas": policy.falha.assinaturas,
@@ -617,12 +644,10 @@ def dump(policy: Policy) -> str:
         linhas.append(f"  - {h.nome}: cmd={list(h.cmd)} quando={h.quando} criterio={h.criterio}")
     linhas.append("")
 
-    bloco("causa_raiz", {
-        "categorias": policy.causa_raiz.categorias,
-        "subtipos": policy.causa_raiz.subtipos,
-    })
-
     linhas.append("=== Blocos não-externalizáveis (imutáveis, fora deste arquivo) ===")
+    linhas.append("  [causa_raiz] (fonte: audit.CAUSE_TAXONOMY)")
+    linhas.append(f"    categorias = {policy.causa_raiz.categorias!r}")
+    linhas.append(f"    subtipos = {policy.causa_raiz.subtipos!r}")
     for b in IMMUTABLE_BLOCKS:
         linhas.append(f"  - {b.nome} ({b.referencia})")
         linhas.append(f"    {b.razao}")

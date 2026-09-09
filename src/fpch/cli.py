@@ -40,6 +40,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import sys
 from pathlib import Path
 
@@ -52,6 +53,16 @@ DEFAULT_FICHE_DIR = REPO_ROOT / "docs" / "referencias" / "fichamentos"
 
 #: Código de saída para "não chegou a rodar" — ver o docstring do módulo.
 EXIT_USO = 2
+
+
+def _timeout_positivo(valor: str) -> float:
+    try:
+        numero = float(valor)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("timeout deve ser um número") from exc
+    if not math.isfinite(numero) or numero <= 0:
+        raise argparse.ArgumentTypeError("timeout deve ser positivo e finito")
+    return numero
 
 
 def _cmd_models(args: argparse.Namespace) -> int:
@@ -608,8 +619,8 @@ def build_parser() -> argparse.ArgumentParser:
     ck.add_argument("--todos", action="store_true",
                     help="roda todos os hooks declarados, seja qual for o `quando`")
     ck.add_argument("--cwd", help="diretório de trabalho dos hooks (default: o atual)")
-    ck.add_argument("--timeout", type=float, default=hooks.DEFAULT_TIMEOUT_S,
-                    help=f"teto por hook, em segundos (default: {hooks.DEFAULT_TIMEOUT_S})")
+    ck.add_argument("--timeout", type=_timeout_positivo, default=None,
+                    help="teto por hook, em segundos (default: [verificacao].timeout_s da política)")
     ck.add_argument("--label", help="rótulo para os eventos `verify` na trilha")
     ck.set_defaults(fn=_cmd_check)
 
