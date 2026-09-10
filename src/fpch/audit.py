@@ -51,10 +51,14 @@ import hashlib
 import json
 import math
 import os
+import stat
 import sys
+import threading
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from pathlib import Path
+from typing import Iterator
 
 SCHEMA_VERSION = 4
 
@@ -306,6 +310,14 @@ _warned_vocab = False
 #: Ponta da cadeia por arquivo, para não reler o arquivo inteiro a cada escrita.
 _tip_cache: dict[str, str | None] = {}
 
+# ``flock``/``msvcrt.locking`` serializam processos. Locks de thread também são
+# necessários porque a semântica de locks de arquivo dentro do mesmo processo
+# varia entre plataformas. O sidecar permanece em disco de propósito: apagá-lo
+# ao liberar permitiria que um processo ainda esperando no inode antigo e outro
+# processo no inode recém-criado entrassem juntos na seção crítica.
+_thread_locks: dict[str, threading.Lock] = {}
+_thread_locks_guard = threading.Lock()
+
 #: Próximo `seq` por trajetória. Contador de processo, não do arquivo.
 _seq_counters: dict[str, int] = {}
 
@@ -349,6 +361,8 @@ def reset_state() -> None:
     _warned_vocab = False
     _tip_cache.clear()
     _seq_counters.clear()
+    with _thread_locks_guard:
+        _thread_locks.clear()
 
 
 # ---------------------------------------------------------------------------
@@ -430,37 +444,276 @@ def _chain_tip(target: Path) -> str | None:
 # Escrita
 # ---------------------------------------------------------------------------
 
+
+def _safe_display(value: object, *, limit: int = 500) -> str:
+    """Texto de erro sem controles literais nem volume ilimitado."""
+    rendered = str(value)
+    safe = "".join(
+        character
+        if character.isprintable() and character not in "\r\n"
+        else f"\\u{ord(character):04x}"
+        for character in rendered
+    )
+    return safe if len(safe) <= limit else safe[:limit] + "…"
+
+
+def _same_file(first: os.stat_result, second: os.stat_result) -> bool:
+    try:
+        return os.path.samestat(first, second)
+    except (AttributeError, OSError):
+        return (first.st_dev, first.st_ino) == (second.st_dev, second.st_ino)
+
+
+def _is_linklike(path: Path) -> bool:
+    try:
+        metadata = path.lstat()
+    except FileNotFoundError:
+        return False
+    if stat.S_ISLNK(metadata.st_mode):
+        return True
+    attributes = getattr(metadata, "st_file_attributes", 0)
+    reparse = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+    if attributes & reparse:
+        return True
+    isjunction = getattr(os.path, "isjunction", None)
+    return bool(isjunction is not None and isjunction(path))
+
+
+def _reject_linklike_path(path: Path) -> None:
+    current = path
+    while True:
+        if _is_linklike(current):
+            role = "trilha" if current == path else "ancestral da trilha"
+            raise OSError(
+                f"{role} não pode ser link, junction ou reparse point: "
+                f"{_safe_display(current)}"
+            )
+        parent = current.parent
+        if parent == current:
+            return
+        current = parent
+
+
+def _open_verified(path: Path, flags: int, mode: int = 0o600) -> tuple[int, os.stat_result]:
+    flags |= getattr(os, "O_BINARY", 0)
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(path, flags, mode)
+    try:
+        opened = os.fstat(descriptor)
+        current = path.lstat()
+        if _is_linklike(path) or not _same_file(opened, current):
+            raise OSError(f"alvo inseguro ou trocado durante abertura: {_safe_display(path)}")
+    except Exception:
+        os.close(descriptor)
+        raise
+    return descriptor, opened
+
+
+def _thread_lock(path: Path) -> threading.Lock:
+    key = os.path.abspath(os.fspath(path))
+    with _thread_locks_guard:
+        return _thread_locks.setdefault(key, threading.Lock())
+
+
+def _lock_os(descriptor: int) -> None:
+    os.lseek(descriptor, 0, os.SEEK_SET)
+    if os.name == "nt":
+        import msvcrt
+
+        msvcrt.locking(descriptor, msvcrt.LK_LOCK, 1)
+    else:
+        import fcntl
+
+        fcntl.flock(descriptor, fcntl.LOCK_EX)
+
+
+def _unlock_os(descriptor: int) -> None:
+    try:
+        os.lseek(descriptor, 0, os.SEEK_SET)
+        if os.name == "nt":
+            import msvcrt
+
+            msvcrt.locking(descriptor, msvcrt.LK_UNLCK, 1)
+        else:
+            import fcntl
+
+            fcntl.flock(descriptor, fcntl.LOCK_UN)
+    except OSError:
+        # Fechar o descritor também libera o lock. A falha de unlock não pode
+        # impedir esse cleanup mais forte no finally externo.
+        pass
+
+
+@contextmanager
+def _trail_lock(target: Path) -> Iterator[None]:
+    """Serializa escritores por processo e entre processos."""
+    lock_path = target.with_name(target.name + ".lock")
+    local_lock = _thread_lock(lock_path)
+    with local_lock:
+        descriptor: int | None = None
+        locked = False
+        try:
+            _reject_linklike_path(target)
+            _reject_linklike_path(lock_path)
+            target.parent.mkdir(parents=True, exist_ok=True)
+            _reject_linklike_path(target)
+            _reject_linklike_path(lock_path)
+            descriptor, metadata = _open_verified(
+                lock_path,
+                os.O_RDWR | os.O_CREAT,
+            )
+            if metadata.st_size == 0:
+                os.write(descriptor, b"0")
+            _lock_os(descriptor)
+            locked = True
+
+            # A verificação após adquirir o lock reduz a janela entre validar
+            # os caminhos e entrar na seção crítica.
+            _reject_linklike_path(target)
+            current_lock = lock_path.lstat()
+            if not _same_file(os.fstat(descriptor), current_lock):
+                raise OSError("arquivo de lock foi trocado durante a aquisição")
+            yield
+        finally:
+            if descriptor is not None:
+                if locked:
+                    _unlock_os(descriptor)
+                try:
+                    os.close(descriptor)
+                except OSError:
+                    pass
+
+
+def _tail_hash_from_descriptor(descriptor: int) -> str | None:
+    """Último hash a partir do mesmo inode aberto para append."""
+    duplicate = os.dup(descriptor)
+    with os.fdopen(duplicate, "rb") as stream:
+        stream.seek(0, os.SEEK_END)
+        size = stream.tell()
+        if not size:
+            return None
+        chunk = 8192
+        while True:
+            start = max(0, size - chunk)
+            stream.seek(start)
+            lines = stream.read(size - start).split(b"\n")
+            if start > 0:
+                lines = lines[1:]
+            for raw in reversed(lines):
+                raw = raw.strip()
+                if not raw:
+                    continue
+                try:
+                    row = json.loads(raw.decode("utf-8"))
+                except (ValueError, UnicodeDecodeError):
+                    continue
+                if isinstance(row, dict) and row.get("hash"):
+                    return str(row["hash"])
+            if start == 0:
+                return None
+            chunk *= 4
+
+
+def _write_all(descriptor: int, data: bytes) -> None:
+    view = memoryview(data)
+    while view:
+        written = os.write(descriptor, view)
+        if written <= 0:
+            raise OSError("append da trilha não avançou")
+        view = view[written:]
+
+
+def _fsync_directory(directory: Path) -> None:
+    """Persiste a entrada do arquivo em sistemas que aceitam fsync de diretório."""
+    if os.name == "nt":
+        return
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+    descriptor = os.open(directory, flags)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def _record_write_failure(target: Path, exc: BaseException) -> bool:
+    global _write_failures, _warned_write
+    _write_failures += 1
+    if not _warned_write:
+        _warned_write = True
+        print(
+            "fpch: AVISO — falha ao gravar a trilha de auditoria em "
+            f"{_safe_display(target)}: {_safe_display(exc)}. "
+            "A execução continua, mas esta sessão não é auditável.",
+            file=sys.stderr,
+        )
+    return False
+
+
 def write(ev: Event, path: Path | None = None) -> bool:
     """Grava um evento encadeado. Devolve se conseguiu.
 
     Falha de trilha não derruba a chamada que a originou — mas também não some:
-    conta, avisa uma vez em stderr, e devolve False para quem quiser reagir.
+    conta, avisa uma vez em stderr, e devolve False para quem quiser reagir. O
+    hash anterior é calculado sob lock interprocesso; ``True`` só é devolvido
+    depois de flush equivalente no descritor, ``fsync`` do arquivo e, quando o
+    sistema permite, ``fsync`` do diretório.
     """
-    global _write_failures, _warned_write
-    target = path or _default_log_path()
-
-    ev.prev_hash = _chain_tip(target)
-    payload = _payload(ev)
-    payload["hash"] = ev.hash = compute_hash(payload)
-    line = json.dumps(payload, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
-
+    target = Path(os.path.abspath(os.fspath(path or _default_log_path())))
+    descriptor: int | None = None
+    original_size: int | None = None
     try:
-        target.parent.mkdir(parents=True, exist_ok=True)
-        with target.open("a", encoding="utf-8") as fh:
-            fh.write(line + "\n")
-    except OSError as exc:
-        _write_failures += 1
-        if not _warned_write:
-            _warned_write = True
-            print(
-                f"fpch: AVISO — falha ao gravar a trilha de auditoria em {target}: {exc}. "
-                "A execução continua, mas esta sessão não é auditável.",
-                file=sys.stderr,
-            )
-        return False
+        base_payload = _payload(ev)
+        base_payload.pop("prev_hash", None)
+        base_payload.pop("hash", None)
+        with _trail_lock(target):
+            try:
+                descriptor, opened = _open_verified(
+                    target,
+                    os.O_RDWR | os.O_APPEND | os.O_CREAT,
+                )
+                original_size = os.lseek(descriptor, 0, os.SEEK_END)
+                previous = _tail_hash_from_descriptor(descriptor)
+                payload = dict(base_payload)
+                if previous is not None:
+                    payload["prev_hash"] = previous
+                current_hash = compute_hash(payload)
+                payload["hash"] = current_hash
+                line = json.dumps(
+                    payload,
+                    sort_keys=True,
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                ).encode("utf-8") + b"\n"
 
-    _tip_cache[str(target)] = ev.hash
-    return True
+                _write_all(descriptor, line)
+                os.fsync(descriptor)
+                _fsync_directory(target.parent)
+                if not _same_file(opened, target.lstat()):
+                    raise OSError("trilha foi trocada durante o append")
+
+                ev.prev_hash = previous
+                ev.hash = current_hash
+                _tip_cache[str(target)] = current_hash
+                return True
+            except (OSError, ValueError, UnicodeError, TypeError):
+                # Rollback ainda sob o mesmo lock: truncar depois de liberar
+                # poderia apagar o append válido do próximo escritor.
+                if descriptor is not None and original_size is not None:
+                    try:
+                        os.ftruncate(descriptor, original_size)
+                        os.fsync(descriptor)
+                    except OSError:
+                        pass
+                raise
+            finally:
+                if descriptor is not None:
+                    try:
+                        os.close(descriptor)
+                    except OSError:
+                        pass
+                    descriptor = None
+    except (OSError, ValueError, UnicodeError, TypeError) as exc:
+        return _record_write_failure(target, exc)
 
 
 # ---------------------------------------------------------------------------

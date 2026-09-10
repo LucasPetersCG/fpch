@@ -10,6 +10,9 @@ Nenhum teste toca o `~/.fpch` real: todos escrevem em `tmp_path`.
 from __future__ import annotations
 
 import json
+import threading
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
 
 import pytest
 
@@ -119,6 +122,49 @@ def test_cadeia_continua_entre_processos(trilha):
     assert audit.verify_chain(trilha) == (True, None)
 
 
+def test_dois_writers_concorrentes_nao_reutilizam_prev_hash(
+    trilha, monkeypatch
+):
+    """O segundo writer só calcula a ponta depois do append durável do primeiro."""
+    # Evita que o write controlado abaixo intercepte a inicialização de um byte
+    # do sidecar antes de chegar ao append JSON que interessa ao teste.
+    trilha.with_name(trilha.name + ".lock").write_bytes(b"0")
+    real_write = audit.os.write
+    first_inside_append = threading.Event()
+    release_first = threading.Event()
+    selection_guard = threading.Lock()
+    selected = False
+
+    def controlled_write(descriptor, data):
+        nonlocal selected
+        should_pause = False
+        if bytes(data).startswith(b"{"):
+            with selection_guard:
+                if not selected:
+                    selected = True
+                    should_pause = True
+        if should_pause:
+            first_inside_append.set()
+            assert release_first.wait(5), "teste não liberou o primeiro writer"
+        return real_write(descriptor, data)
+
+    monkeypatch.setattr(audit.os, "write", controlled_write)
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        first = executor.submit(audit.write, _evento(0, tid="concorrente"), trilha)
+        assert first_inside_append.wait(5), "primeiro writer não chegou ao append"
+        second = executor.submit(audit.write, _evento(1, tid="concorrente"), trilha)
+        release_first.set()
+        assert first.result(timeout=5) is True
+        assert second.result(timeout=5) is True
+
+    linhas = _linhas(trilha)
+    assert len(linhas) == 2
+    assert "prev_hash" not in linhas[0]
+    assert linhas[1]["prev_hash"] == linhas[0]["hash"]
+    assert linhas[1]["hash"] != linhas[0]["hash"]
+    assert audit.verify_chain(trilha) == (True, None)
+
+
 # --------------------------------------------------------------------------
 # Escrita nunca silenciosa
 # --------------------------------------------------------------------------
@@ -138,6 +184,57 @@ def test_falha_de_escrita_e_observavel_e_nao_levanta(tmp_path, capsys):
     assert audit.write(_evento(1), alvo) is False
     assert audit.counters()["write_failures"] == 2
     assert capsys.readouterr().err == ""
+
+
+def test_falha_de_fsync_retorna_false_reverte_append_e_preserva_evento(
+    trilha, monkeypatch, capsys
+):
+    event = _evento(0, model="sem-durabilidade")
+    before = (event.prev_hash, event.hash)
+
+    def broken_fsync(_descriptor):
+        raise OSError("fsync indisponível")
+
+    monkeypatch.setattr(audit.os, "fsync", broken_fsync)
+
+    assert audit.write(event, trilha) is False
+    assert trilha.read_bytes() == b""
+    assert (event.prev_hash, event.hash) == before
+    assert audit.counters()["write_failures"] == 1
+    assert "fsync indisponível" in capsys.readouterr().err
+
+
+def test_trilha_symlink_e_rejeitada_sem_tocar_destino(tmp_path, capsys):
+    destination = tmp_path / "destino.jsonl"
+    destination.write_text("preservar\n", encoding="utf-8")
+    trail = tmp_path / "audit.jsonl"
+    try:
+        trail.symlink_to(destination)
+    except (NotImplementedError, OSError) as exc:
+        pytest.skip(f"links simbólicos indisponíveis neste ambiente: {exc}")
+
+    assert audit.write(_evento(0), trail) is False
+    assert destination.read_text(encoding="utf-8") == "preservar\n"
+    assert "link, junction ou reparse" in capsys.readouterr().err
+
+
+def test_trilha_marcada_como_junction_e_rejeitada(
+    tmp_path, monkeypatch, capsys
+):
+    trail = tmp_path / "audit.jsonl"
+    trail.mkdir()
+    real_isjunction = getattr(audit.os.path, "isjunction", lambda _path: False)
+    monkeypatch.setattr(
+        audit.os.path,
+        "isjunction",
+        lambda path: Path(path) == trail or real_isjunction(path),
+        raising=False,
+    )
+
+    assert audit.write(_evento(0), trail) is False
+    assert trail.is_dir()
+    assert tuple(trail.iterdir()) == ()
+    assert "link, junction ou reparse" in capsys.readouterr().err
 
 
 # --------------------------------------------------------------------------

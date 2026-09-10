@@ -12,6 +12,10 @@
     fpch improve                     lê a trilha e PROPÕE mudança de política (não aplica)
     fpch --policy P improve --apply <id>   autoriza uma proposta, no arquivo que você nomeou
     fpch discover <repo> --json      descobre linguagens, dependências e CI/CD, só leitura
+    fpch setup plan <repo> --answers respostas.json --json
+                                      gera plano local sem alterar o repositório
+    fpch setup apply plano.json --confirm <plan_id>
+                                      aplica exatamente o plano confirmado
     fpch quote-check <ficha> <fonte> trechos entre aspas existem na fonte?
     fpch canib add <url> [--note]    enfileira alvo
     fpch canib list                  fila
@@ -42,6 +46,8 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import os
+import stat
 import sys
 from pathlib import Path
 
@@ -58,6 +64,7 @@ from . import (
     policy,
     quotes,
     router,
+    setup,
 )
 from .models import TaskClass
 
@@ -67,6 +74,89 @@ DEFAULT_FICHE_DIR = REPO_ROOT / "docs" / "referencias" / "fichamentos"
 
 #: Código de saída para "não chegou a rodar" — ver o docstring do módulo.
 EXIT_USO = 2
+
+
+def _safe_cli_error(error: BaseException, *, limit: int = 500) -> str:
+    """Representa erros sem devolver controles literais vindos da entrada."""
+    rendered = str(error)
+    safe = "".join(
+        character
+        if character.isprintable() and character not in "\r\n"
+        else f"\\u{ord(character):04x}"
+        for character in rendered
+    )
+    return safe if len(safe) <= limit else safe[:limit] + "…"
+
+
+def _is_linklike(path: Path) -> bool:
+    """Reconhece links, junctions e outros reparse points sem segui-los."""
+    try:
+        metadata = path.lstat()
+    except FileNotFoundError:
+        return False
+    except OSError as exc:
+        raise OSError(f"não foi possível inspecionar {path}: {exc}") from exc
+
+    if stat.S_ISLNK(metadata.st_mode):
+        return True
+    attributes = getattr(metadata, "st_file_attributes", 0)
+    reparse = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
+    if reparse and attributes & reparse:
+        return True
+    isjunction = getattr(os.path, "isjunction", None)
+    return bool(isjunction is not None and isjunction(path))
+
+
+def _save_new_utf8(path: str | Path, payload: str) -> Path:
+    """Cria texto UTF-8 exclusivamente, sem atravessar ancestrais link-like."""
+    target = Path(path)
+    current = target
+    while True:
+        if _is_linklike(current):
+            role = "saída" if current == target else "ancestral da saída"
+            raise OSError(
+                f"{role} não pode ser link, junction ou reparse point: {current}"
+            )
+        parent = current.parent
+        if parent == current:
+            break
+        current = parent
+
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    flags |= getattr(os, "O_BINARY", 0)
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    descriptor: int | None = None
+    created: os.stat_result | None = None
+    try:
+        descriptor = os.open(target, flags, 0o600)
+        created = os.fstat(descriptor)
+        stream = os.fdopen(descriptor, "w", encoding="utf-8", newline="\n")
+        descriptor = None
+        with stream:
+            stream.write(payload)
+            stream.flush()
+            os.fsync(stream.fileno())
+    except FileExistsError as exc:
+        raise OSError(f"saída já existe: {target}") from exc
+    except (OSError, UnicodeError) as exc:
+        if descriptor is not None:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+        if created is not None:
+            try:
+                current_metadata = target.lstat()
+                same = os.path.samestat(created, current_metadata)
+            except (FileNotFoundError, OSError, AttributeError):
+                same = False
+            if same:
+                try:
+                    target.unlink()
+                except OSError:
+                    pass
+        raise OSError(f"não foi possível criar saída {target}: {exc}") from exc
+    return target
 
 
 def _timeout_positivo(valor: str) -> float:
@@ -365,7 +455,7 @@ def _cmd_interview(args: argparse.Namespace) -> int:
         if args.output is not None:
             interview.save_new(args.output, preferences)
     except interview.FpchInterviewError as exc:
-        print(f"erro de entrevista: {exc}", file=sys.stderr)
+        print(f"erro de entrevista: {_safe_cli_error(exc)}", file=sys.stderr)
         return EXIT_USO
 
     if args.json:
@@ -381,6 +471,108 @@ def _cmd_interview(args: argparse.Namespace) -> int:
     print(f"  formatadores obrigatórios: {human(preferences.mandatory_formatters)}")
     if args.output is not None:
         print(f"  arquivo criado: {Path(args.output)}")
+    return 0
+
+
+def _cmd_setup_plan(args: argparse.Namespace) -> int:
+    """Produz um plano C4a determinístico; não altera o repositório-alvo."""
+    try:
+        report = discovery.discover(args.repo)
+    except discovery.FpchDiscoveryError as exc:
+        print(f"erro de descoberta: {exc}", file=sys.stderr)
+        return EXIT_USO
+
+    try:
+        source = (
+            getattr(sys.stdin, "buffer", sys.stdin)
+            if args.answers == "-"
+            else Path(args.answers)
+        )
+        preferences = interview.load_answers(source)
+        setup_plan = setup.plan(report, preferences)
+        payload = setup.dumps(setup_plan)
+    except interview.FpchInterviewError as exc:
+        print(f"erro de entrevista: {_safe_cli_error(exc)}", file=sys.stderr)
+        return EXIT_USO
+    except setup.FpchSetupError as exc:
+        print(f"erro de plano: {_safe_cli_error(exc)}", file=sys.stderr)
+        return EXIT_USO
+
+    if args.output is not None:
+        try:
+            _save_new_utf8(args.output, payload)
+        except OSError as exc:
+            print(f"erro ao salvar plano: {_safe_cli_error(exc)}", file=sys.stderr)
+            return 1
+
+    if args.json:
+        print(payload, end="")
+    else:
+        print(f"plano: {setup_plan.plan_id}")
+        print(f"repositório: {setup_plan.repo}")
+        print(f"artefatos: {len(setup_plan.artifacts)}")
+        print(f"conflitos: {len(setup_plan.conflicts)}")
+        print(f"MCPs não resolvidos: {len(setup_plan.unresolved_mcps)}")
+        for conflict in setup_plan.conflicts:
+            print(f"  conflito: {conflict.path} — {conflict.reason}")
+        for mcp in setup_plan.unresolved_mcps:
+            print(f"  MCP bloqueado: {mcp}")
+        if args.output is not None:
+            print(f"arquivo criado: {Path(args.output)}")
+
+    return 1 if setup_plan.conflicts else 0
+
+
+def _cmd_setup_apply(args: argparse.Namespace) -> int:
+    """Aplica exatamente o plano persistido e confirmado pelo autor."""
+    path = Path(args.plan_path)
+    limit = getattr(
+        setup,
+        "FPCH_SETUP_PLAN_MAX_BYTES",
+        getattr(setup, "FPCH_SETUP_MAX_BYTES", 1024 * 1024),
+    )
+    try:
+        with path.open("rb") as stream:
+            raw = stream.read(limit + 1)
+    except OSError as exc:
+        print(
+            f"erro ao ler plano {_safe_cli_error(path)}: {_safe_cli_error(exc)}",
+            file=sys.stderr,
+        )
+        return 1
+
+    try:
+        setup_plan = setup.loads(raw)
+    except setup.FpchSetupError as exc:
+        print(f"erro de plano: {_safe_cli_error(exc)}", file=sys.stderr)
+        return EXIT_USO
+
+    if args.confirm != setup_plan.plan_id:
+        print(
+            "erro de uso: --confirm deve ser exatamente o plan_id do arquivo",
+            file=sys.stderr,
+        )
+        return EXIT_USO
+
+    try:
+        result = setup.apply(
+            setup_plan,
+            confirmation=args.confirm,
+            trilha=Path(args.trilha) if args.trilha is not None else None,
+        )
+    except setup.FpchSetupError as exc:
+        print(f"erro ao aplicar plano: {_safe_cli_error(exc)}", file=sys.stderr)
+        return 1
+
+    if not result.ok:
+        detail = ": " + ", ".join(result.conflict) if result.conflict else ""
+        print(f"plano não aplicado{detail}", file=sys.stderr)
+        return 1
+
+    print(f"plano aplicado: {result.plan_id}")
+    print(f"criados: {len(result.created)}")
+    print(f"inalterados: {len(result.unchanged)}")
+    print(f"auditoria registrada: {'sim' if result.audit_written else 'não'}")
     return 0
 
 
@@ -755,6 +947,49 @@ def build_parser() -> argparse.ArgumentParser:
         help="cria exclusivamente este arquivo; nunca sobrescreve",
     )
     iv.set_defaults(fn=_cmd_interview)
+
+    su = sub.add_parser(
+        "setup",
+        help="planeja ou aplica a criação local e determinística do harness",
+    )
+    susub = su.add_subparsers(dest="setup_cmd", required=True)
+
+    supl = susub.add_parser(
+        "plan",
+        help="gera um plano sem alterar o repositório",
+    )
+    supl.add_argument("repo", help="diretório do repositório-alvo")
+    supl.add_argument(
+        "--answers",
+        metavar="CAMINHO|-",
+        required=True,
+        help="respostas C3 em JSON, de um arquivo ou de stdin com '-'",
+    )
+    supl.add_argument("--json", action="store_true", help="emite o plano canônico em JSON")
+    supl.add_argument(
+        "--output",
+        metavar="CAMINHO",
+        help="cria exclusivamente este arquivo de plano; nunca sobrescreve",
+    )
+    supl.set_defaults(fn=_cmd_setup_plan)
+
+    suap = susub.add_parser(
+        "apply",
+        help="aplica exatamente um plano persistido mediante confirmação",
+    )
+    suap.add_argument("plan_path", metavar="PLAN_PATH", help="arquivo JSON do plano")
+    suap.add_argument(
+        "--confirm",
+        metavar="PLAN_ID",
+        required=True,
+        help="plan_id exato que autoriza esta aplicação",
+    )
+    suap.add_argument(
+        "--trilha",
+        metavar="CAMINHO",
+        help="trilha de auditoria a usar nesta aplicação",
+    )
+    suap.set_defaults(fn=_cmd_setup_apply)
 
     au = sub.add_parser("audit", help="resumo de uso por pool")
     au.add_argument("--verify", action="store_true",
