@@ -143,3 +143,35 @@ Após o fechamento dos dias de desenvolvimento e nova medição no estado final,
 6. a evidência honesta de um smoke test sintético, sem apresentá-lo como preferência do autor ou entrevista com participante.
 
 Como em C2, esses pontos comprovam propriedades técnicas do artefato, não validam por si mesmos a pesquisa, o arranjo fatorial ou a adequação das preferências a um desenvolvedor real. C4 permanece responsável por transformar descoberta e preferências em artefatos gerados e instaláveis.
+
+## 11. Apêndice de desenvolvimento: C4a — setup local parcial
+
+Em 09/09/2026, `fpch setup plan/apply` implementou a primeira fatia de C4 sem fechá-la. O plano determinístico e autocontido consome os snapshots canônicos de C2 e C3, registra seus hashes e a identidade física da raiz e descreve três artefatos locais: `AGENTS.md`, `CLAUDE.md` e `.fpch/setup-manifest.json`. O `plan_id` cobre o conteúdo lógico do plano. Planejar não altera o repositório-alvo; a persistência opcional do próprio plano é explícita e *create-only*.
+
+A aplicação exige confirmação literal do `plan_id`, redescobre o repositório e revalida identidade da raiz, snapshot C2 e estados observados. A política é *create-only*: um arquivo idêntico é preservado, enquanto conteúdo divergente, objeto não regular ou caminho inseguro vira conflito sem sobrescrita.
+
+## 12. Transação, auditoria e limites de concorrência
+
+A aplicação usa *lock* e *journal* durável em `.fpch/`. Cada avanço do journal recebe `fsync`; antes da auditoria, uma falha move apenas artefatos ainda identificáveis como próprios da transação para quarentena, verifica identidade e hash e os remove em ordem inversa. Falha de auditoria também aciona rollback. O evento `install` inclui uma inversa estruturada com arquivos, hashes, modos, ordem e identidade da raiz, mas o executor `fpch undo` continua pendente em C25.
+
+O escritor da trilha foi endurecido com *lock* de thread e processo, revalidação da identidade do arquivo de lock e `fsync` do arquivo e, quando suportado, do diretório. O modelo declarado é **trusted single writer**, não defesa formal contra um escritor local hostil concorrente. Uma interrupção no intervalo em que a auditoria pode ter sido anexada, mas o journal ainda não chegou a `committed`, deixa resultado ambíguo; por isso o estado `auditing` falha fechado e exige recuperação explícita.
+
+## 13. Dogfood e verificação após C4a
+
+O dogfood foi deliberadamente limitado a `fpch setup plan` sobre este repositório. O plano detectou conflitos com artefatos já existentes e não escreveu no alvo; portanto, demonstrou classificação conservadora e ausência de sobrescrita, não aplicação bem-sucedida no próprio FPCH.
+
+| Verificação | Resultado em 09/09/2026 |
+|---|---|
+| Suíte completa | **402 passed, 6 skipped** |
+| Commit de implementação | `c2723b7` |
+| Código do protótipo | **15 módulos, 8.747 linhas físicas em `src/fpch/`** |
+| Testes | **16 arquivos, 5.810 linhas físicas** |
+| Grafo graphify | **5.351 nós, 6.568 arestas, 489 comunidades** |
+| Dogfood | plano apenas; conflitos detectados; zero escrita no repositório-alvo |
+| Entregáveis acadêmicos | `docs/tcc/**` sem alteração |
+
+## 14. Fronteira ainda aberta de C4
+
+C4a gera apenas arquivos locais conhecidos. Ela não instala ferramentas, *skills* nem servidores MCP e não resolve procedência de software externo. O próximo passo coerente é o mínimo conjunto C16/C7: checkpoint determinístico de nome, fonte e versão sob uma política explícita de segurança. C4 permanece parcial; C15, C17, C23 e C25 não foram fechados.
+
+Como C2 e C3, este registro é evidência técnica candidata a integração futura, após nova medição no estado final. Ele não altera o TCC nem transforma testes de engenharia em validação da pesquisa.

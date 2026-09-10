@@ -1,10 +1,10 @@
-# FPCH — PoC (C1–C3)
+# FPCH — PoC (C1–C4a)
 
 > 🧭 **Mapa de docs:** [`AGENTS.md`](../AGENTS.md) · [`docs/PROJECT.md`](../docs/PROJECT.md) · [`docs/STATUS.md`](../docs/STATUS.md) · [`TODO.md`](../TODO.md) · [`docs/analises/fpch-evidencias-desenvolvimento.md`](../docs/analises/fpch-evidencias-desenvolvimento.md) · [`docs/analises/camada-multi-modelo.md`](../docs/analises/camada-multi-modelo.md) · [`docs/referencias/estado-da-arte-2026-07.md`](../docs/referencias/estado-da-arte-2026-07.md)
 
-Código do FPCH. Nasceu cobrindo **C1** (camada de acesso multi-modelo) e a ferramenta **cannibalize**; desde a fatia funcional de 01/09/2026 instancia **as cinco camadas do framework** — política (`policy.py`), hooks determinísticos (`hooks.py`), laço de autoaprimoramento (`improve.py`), trilha verificável (`audit.py` + `fpch audit --verify`) e acesso multi-modelo (`router.py`/`backends.py`/`models.py`). Em 09/09/2026, C2 acrescentou a exploração automática em `discovery.py` e C3, a captura explícita de preferências em `interview.py`. **14 módulos, 6.686 linhas físicas de código; 14 arquivos e 4.977 linhas físicas de testes; 369 testes passando e 3 ignorados** (medido em 09/09/2026).
+Código do FPCH. Nasceu cobrindo **C1** (camada de acesso multi-modelo) e a ferramenta **cannibalize**; desde a fatia funcional de 01/09/2026 instancia **as cinco camadas do framework** — política (`policy.py`), hooks determinísticos (`hooks.py`), laço de autoaprimoramento (`improve.py`), trilha verificável (`audit.py` + `fpch audit --verify`) e acesso multi-modelo (`router.py`/`backends.py`/`models.py`). Em 09/09/2026, C2 acrescentou a exploração automática em `discovery.py`, C3 a captura explícita de preferências em `interview.py` e C4a o setup local com transação compensatória journalada em `setup.py`. **15 módulos, 8.747 linhas físicas de código; 16 arquivos e 5.810 linhas físicas de testes; 402 testes passando e 6 ignorados** (medido em 09/09/2026).
 
-**Status:** C1 funcional e verificado ponta a ponta desde 16/07/2026; C2 e C3 concluídas em 09/09/2026. C4 fará a geração e instalação. Stack: **Python ≥3.11 + uv**. Zero dependências de runtime — só a stdlib e os CLIs oficiais já instalados.
+**Status:** C1 funcional e verificado ponta a ponta desde 16/07/2026; C2 e C3 concluídas em 09/09/2026; C4a implementada como fatia parcial local. C4 continua aberta e MCP externo está bloqueado por C16/C7. Stack: **Python ≥3.11 + uv**. Zero dependências de runtime — só a stdlib e os CLIs oficiais já instalados.
 
 ## Uso
 
@@ -15,6 +15,8 @@ uv run fpch discover . --json         # explora manifestos e CI/CD sem modificar
 uv run fpch interview .               # captura preferências explícitas em TTY
 uv run fpch interview . --answers preferences.json --json
 uv run fpch interview . --answers - --output preferences.json
+uv run fpch setup plan . --answers preferences.json --json --output fpch-setup-plan.json
+uv run fpch setup apply fpch-setup-plan.json --confirm <plan_id>
 uv run fpch ask standard "prompt"     # roteia
 uv run fpch ask hard --file spec.md   # prompt longo vem de arquivo
 uv run fpch audit                     # para onde a cota foi
@@ -29,7 +31,7 @@ uv run fpch audit --verify            # confere o encadeamento de hashes da tril
 
 O comando não executa subprocessos, não acessa a rede e não escreve no repositório inspecionado. Cada manifesto tem limite de 1 MiB; *symlinks*, *junctions* e demais *reparse points* são ignorados; problemas de leitura ou análise viram avisos estruturados. No dogfood do FPCH, detectou Python e `pytest >=8` em `pyproject.toml`, no escopo `group:dev`, sem CI/CD nem avisos, com exit 0.
 
-Limites assumidos neste corte: não interpreta configurações específicas de Poetry/PDM, *workspaces* nem classifica semanticamente as dependências. C3 faz a entrevista; C4 fará a geração e instalação. Evidências reproduzíveis e ressalvas estão em [`docs/analises/fpch-evidencias-desenvolvimento.md`](../docs/analises/fpch-evidencias-desenvolvimento.md).
+Limites assumidos neste corte: não interpreta configurações específicas de Poetry/PDM, *workspaces* nem classifica semanticamente as dependências. C3 faz a entrevista; C4a consome ambos os snapshots para gerar artefatos locais. Evidências reproduzíveis e ressalvas estão em [`docs/analises/fpch-evidencias-desenvolvimento.md`](../docs/analises/fpch-evidencias-desenvolvimento.md).
 
 ## Entrevista (`interview`)
 
@@ -39,7 +41,17 @@ Sem `--answers`, o comando entrevista em TTY. Com `--answers PATH`, lê JSON de 
 
 O comando é offline: não executa subprocessos, não usa rede, não instala componentes e, por padrão, apenas apresenta o resultado. Só grava quando `--output` é fornecido explicitamente. Essa gravação é criação exclusiva, com modo `0600`; recusa alvo ou ancestral que seja *symlink*, *junction* ou outro *reparse point*, e remove uma saída parcial somente se ela ainda tiver a identidade do arquivo criado pela própria execução. Permanece um limite TOCTOU inerente no intervalo entre verificações do caminho e chamadas ao sistema de arquivos; portanto, isto é contenção defensiva, não garantia formal contra um adversário local concorrente.
 
-O smoke test real foi não interativo e usou **respostas sintéticas** (`context-mode:ctx-search`, `ruff`, `black`), não preferências do autor; também não forneceu `--output`, portanto não persistiu arquivo. C4 continuará responsável por gerar e instalar o harness.
+O smoke test real foi não interativo e usou **respostas sintéticas** (`context-mode:ctx-search`, `ruff`, `black`), não preferências do autor; também não forneceu `--output`, portanto não persistiu arquivo. C4a agora consome essas respostas apenas para planejar e criar artefatos locais conhecidos.
+
+## Setup local com transação compensatória (`setup`) — C4a parcial
+
+`fpch setup plan <repo> --answers PATH|- [--json] [--output PATH]` redescobre o repositório, valida respostas C3 e produz um plano canônico para `AGENTS.md`, `CLAUDE.md` e `.fpch/setup-manifest.json`. O plano contém os snapshots C2/C3 e seus hashes, a identidade física da raiz, o conteúdo e estado de cada artefato e um `plan_id` que cobre o contrato inteiro. Planejar é somente leitura no alvo; `--output` apenas cria explicitamente um arquivo de plano e nunca o sobrescreve.
+
+`fpch setup apply PLAN_PATH --confirm PLAN_ID [--trilha CAMINHO]` exige confirmação literal do `plan_id`, revalida a identidade da raiz, repete C2 e compara o snapshot, além de conferir novamente os estados dos artefatos. A aplicação é *create-only*: conteúdo igual fica `unchanged`, conteúdo diferente ou caminho inseguro vira conflito e nada é sobrescrito.
+
+A transação usa *lock* e *journal* em `.fpch/`, com criação exclusiva e `fsync` a cada mudança de estado. Em falha antes da auditoria, arquivos ainda idênticos aos criados pela transação são movidos para quarentena e removidos em ordem inversa; falha ao gravar o evento `install` também aciona rollback. O evento registra uma inversa estruturada, mas `fpch undo` ainda não existe (C25). `audit.write` serializa escritores por *lock* de thread e processo e só confirma após `fsync` do arquivo e, quando suportado, do diretório.
+
+O regime suportado é **trusted single writer**. Uma troca hostil de ancestrais durante chamadas ao sistema fica fora do modelo; alterações detectadas falham fechadas. Se houver interrupção no intervalo ambíguo em que a auditoria pode ter sido escrita, o estado `auditing` exige recuperação explícita, pois repetir ou desfazer automaticamente poderia falsificar o resultado. C4a não instala ferramentas nem MCPs externos: essa parte permanece bloqueada até C16/C7 fornecerem verificação determinística de nome, fonte e versão. C4, C15, C17, C23 e C25 continuam abertas.
 
 Canibalizar um artefato de terceiro:
 
@@ -99,4 +111,4 @@ Essa é a linha real entre uso pretendido e banimento: o ilícito é **mentir so
 - `gemini` CLI **inutilizável** nesta conta (`IneligibleTierError`) — não está no catálogo.
 - `ollama` e `litellm` **não instalados** — a camada API-key (LiteLLM) ainda não existe. Só a camada assinatura está implementada.
 - Custo/potência dos modelos são **juízo do autor**, não medição. O audit log existe justamente para substituir isso por dado.
-- ~~Sem testes automatizados ainda.~~ **Superado:** 339 testes aprovados e 1 ignorado em `tests/` (13 arquivos, 4.552 linhas), `uv run --with pytest pytest tests/ -q`. O único *skip* ocorreu porque o Windows não permitiu criar o *symlink* do E2E de escape; a contenção de *reparse points* está implementada. Os demais limites desta lista são de 16/07/2026 e não foram reconferidos.
+- ~~Sem testes automatizados ainda.~~ **Superado:** 402 testes aprovados e 6 ignorados em `tests/` (16 arquivos, 5.810 linhas), `uv run --with pytest pytest tests/ -q`, medidos em 09/09/2026. *Skip* não conta como aprovação; o detalhamento reproduzível fica em [`docs/analises/fpch-evidencias-desenvolvimento.md`](../docs/analises/fpch-evidencias-desenvolvimento.md). Os demais limites desta lista são de 16/07/2026 e não foram reconferidos.
