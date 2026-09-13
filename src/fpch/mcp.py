@@ -1,22 +1,29 @@
 """Checkpoints declarativos e offline para futuras instalações MCP.
 
-Este módulo somente valida intenções imutáveis e lê seus arquivos JSON.
-Ele não consulta rede, resolve versões, executa código ou instala ferramentas.
+Este módulo valida intenções imutáveis, lê seus arquivos JSON e confere bytes
+de um artefato já obtido localmente contra o checkpoint (SHA-256 e nome).
+Ele não consulta rede, não baixa nem resolve versões ou URLs, não extrai,
+não executa código, não escreve arquivos e não instala ferramentas.
 """
 
 from __future__ import annotations
 
+import hashlib
+import hmac
 import json
 import os
 import re
 import stat
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable, NamedTuple
 from urllib.parse import urlsplit
 
 FPCH_MCP_CHECKPOINT_MAX_BYTES = 1024 * 1024
 FPCH_MCP_VERSION_MAX_LENGTH = 256
+FPCH_MCP_ARTIFACT_MAX_BYTES = 256 * 1024 * 1024
+
+_READ_CHUNK_BYTES = 128 * 1024
 
 _JSON_FIELDS = frozenset(("name", "source", "version", "expected_sha256"))
 _NAME = re.compile(r"[a-z0-9](?:[a-z0-9._-]{0,126}[a-z0-9])?", re.ASCII)
@@ -217,7 +224,11 @@ def _same_file(first: os.stat_result, second: os.stat_result) -> bool:
 
 
 def _same_snapshot(first: os.stat_result, second: os.stat_result) -> bool:
-    """Compara identidade e metadados que denunciam rewrite in-place."""
+    """Compara identidade, modo, tamanho e ``mtime`` de dois snapshots.
+
+    Detecta trocas de arquivo e alterações comuns; não detecta um rewrite
+    in-place que preserve tamanho e restaure o ``mtime``.
+    """
     return (
         _same_file(first, second)
         and first.st_mode == second.st_mode
@@ -227,12 +238,15 @@ def _same_snapshot(first: os.stat_result, second: os.stat_result) -> bool:
 
 
 def _is_linklike(path: Path) -> bool:
+    """Detecta link simbólico, junction ou reparse point sem segui-lo.
+
+    Erros de ``lstat`` diferentes de ausência sobem como ``OSError`` (ou
+    ``ValueError`` para caminho malformado); quem chama decide a mensagem.
+    """
     try:
         metadata = path.lstat()
     except FileNotFoundError:
         return False
-    except OSError as exc:
-        raise FpchMcpError("não foi possível inspecionar checkpoint MCP") from exc
     if stat.S_ISLNK(metadata.st_mode):
         return True
     attributes = getattr(metadata, "st_file_attributes", 0)
@@ -243,33 +257,102 @@ def _is_linklike(path: Path) -> bool:
     return bool(isjunction is not None and isjunction(path))
 
 
-def _reject_linklike_path(path: Path) -> None:
+def _linklike_or_error(path: Path, label: str) -> bool:
+    try:
+        return _is_linklike(path)
+    except FpchMcpError:
+        raise
+    except ValueError as exc:
+        raise FpchMcpError(f"caminho de {label} inválido") from exc
+    except OSError as exc:
+        raise FpchMcpError(f"não foi possível inspecionar {label}") from exc
+
+
+def _reject_linklike_path(path: Path, label: str = "checkpoint MCP") -> None:
     current = path
     while True:
-        if _is_linklike(current):
-            raise FpchMcpError("checkpoint MCP não pode atravessar link ou reparse point")
+        if _linklike_or_error(current, label):
+            raise FpchMcpError(f"{label} não pode atravessar link ou reparse point")
         parent = current.parent
         if parent == current:
             return
         current = parent
 
 
-def load(path: str | Path) -> FpchMcpInstallCheckpoint:
-    """Lê com limite e sem seguir links/reparse points, depois valida o JSON."""
+def _absolute_path(path: object, label: str) -> Path:
+    """Absolutiza lexicalmente (sem ``resolve()``) para vigiar os ancestrais do cwd."""
     if not isinstance(path, (str, Path)):
-        raise FpchMcpError("caminho de checkpoint MCP inválido")
-    target = Path(path)
-    _reject_linklike_path(target)
+        raise FpchMcpError(f"caminho de {label} inválido")
+    try:
+        return Path(os.path.abspath(path))
+    except (TypeError, ValueError) as exc:
+        raise FpchMcpError(f"caminho de {label} inválido") from exc
+
+
+def _disk_basename(target: Path, opened: os.stat_result, label: str) -> str:
+    """Nome real da entrada de diretório que corresponde ao arquivo aberto.
+
+    Procura no diretório-pai a entrada cujo nome coincide com o digitado sem
+    diferenciar maiúsculas/minúsculas e cuja identidade (dispositivo e inode)
+    é a do descritor aberto. Sem entrada única, falha fechado.
+    """
+    wanted = os.path.normcase(target.name).casefold()
+    matches: list[str] = []
+    try:
+        with os.scandir(target.parent) as entries:
+            for entry in entries:
+                if os.path.normcase(entry.name).casefold() != wanted:
+                    continue
+                if _same_file(os.lstat(entry.path), opened):
+                    matches.append(entry.name)
+    except ValueError as exc:
+        raise FpchMcpError(f"caminho de {label} inválido") from exc
+    except OSError as exc:
+        raise FpchMcpError(f"não foi possível inspecionar {label}") from exc
+    if len(matches) != 1:
+        raise FpchMcpError(
+            f"nome em disco do {label} não pôde ser determinado sem ambiguidade"
+        )
+    return matches[0]
+
+
+class _FpchGuardedRead(NamedTuple):
+    size: int
+    disk_basename: str | None
+
+
+def _read_guarded(
+    path: str | Path,
+    *,
+    label: str,
+    max_bytes: int,
+    limit_text: str,
+    consume: Callable[[bytes], None],
+    want_disk_basename: bool = False,
+) -> _FpchGuardedRead:
+    """Lê um arquivo regular em streaming, com limite e sem seguir links.
+
+    Absolutiza o caminho lexicalmente, recusa link, junction ou reparse point
+    no caminho e em todos os ancestrais (antes e depois da leitura), abre com
+    ``O_NOFOLLOW`` quando disponível e compara snapshots de ``lstat``/``fstat``
+    antes e depois da leitura. Cada bloco lido dentro do limite é entregue a
+    ``consume``. Qualquer condição insegura levanta ``FpchMcpError`` — nunca há
+    sucesso parcial.
+    """
+    target = _absolute_path(path, label)
+    _reject_linklike_path(target, label)
     try:
         before = target.lstat()
+    except ValueError as exc:
+        raise FpchMcpError(f"caminho de {label} inválido") from exc
     except OSError as exc:
-        raise FpchMcpError("não foi possível ler checkpoint MCP") from exc
+        raise FpchMcpError(f"não foi possível ler {label}") from exc
     if (
-        _is_linklike(target)
+        _linklike_or_error(target, label)
         or not stat.S_ISREG(before.st_mode)
-        or before.st_size > FPCH_MCP_CHECKPOINT_MAX_BYTES
+        or before.st_size > max_bytes
     ):
-        raise FpchMcpError("arquivo de checkpoint MCP inseguro ou grande demais")
+        raise FpchMcpError(f"arquivo de {label} inseguro ou grande demais")
 
     flags = os.O_RDONLY | getattr(os, "O_BINARY", 0)
     flags |= getattr(os, "O_NOFOLLOW", 0)
@@ -280,42 +363,207 @@ def load(path: str | Path) -> FpchMcpInstallCheckpoint:
         current = target.lstat()
         if (
             not stat.S_ISREG(opened.st_mode)
-            or _is_linklike(target)
+            or _linklike_or_error(target, label)
             or not _same_snapshot(before, opened)
             or not _same_snapshot(opened, current)
         ):
-            raise FpchMcpError("arquivo de checkpoint MCP mudou durante abertura")
-        chunks: list[bytes] = []
+            raise FpchMcpError(f"arquivo de {label} mudou durante abertura")
         size = 0
-        while size <= FPCH_MCP_CHECKPOINT_MAX_BYTES:
-            chunk = os.read(
-                descriptor,
-                min(128 * 1024, FPCH_MCP_CHECKPOINT_MAX_BYTES + 1 - size),
-            )
+        while size <= max_bytes:
+            chunk = os.read(descriptor, min(_READ_CHUNK_BYTES, max_bytes + 1 - size))
             if not chunk:
                 break
-            chunks.append(chunk)
             size += len(chunk)
+            if size > max_bytes:
+                break
+            consume(chunk)
         after = os.fstat(descriptor)
         current = target.lstat()
         if (
-            size > FPCH_MCP_CHECKPOINT_MAX_BYTES
+            size > max_bytes
             or opened.st_size != after.st_size
             or size != after.st_size
             or not _same_snapshot(opened, after)
             or not _same_snapshot(after, current)
-            or _is_linklike(target)
+            or _linklike_or_error(target, label)
         ):
-            raise FpchMcpError("arquivo de checkpoint MCP mudou ou excede 1 MiB")
-        raw = b"".join(chunks)
+            raise FpchMcpError(f"arquivo de {label} mudou ou excede {limit_text}")
+        disk_basename = (
+            _disk_basename(target, opened, label) if want_disk_basename else None
+        )
+        # Revalida os ancestrais com o descritor ainda aberto: fecha a janela em
+        # que um diretório intermediário vira junction/link durante a leitura.
+        _reject_linklike_path(target, label)
     except FpchMcpError:
         raise
+    except ValueError as exc:
+        raise FpchMcpError(f"caminho de {label} inválido") from exc
     except OSError as exc:
-        raise FpchMcpError("não foi possível ler checkpoint MCP") from exc
+        raise FpchMcpError(f"não foi possível ler {label}") from exc
     finally:
         if descriptor is not None:
             try:
                 os.close(descriptor)
             except OSError:
                 pass
-    return loads(raw)
+    return _FpchGuardedRead(size=size, disk_basename=disk_basename)
+
+
+def load(path: str | Path) -> FpchMcpInstallCheckpoint:
+    """Lê com limite e sem seguir links/reparse points, depois valida o JSON."""
+    chunks: list[bytes] = []
+    _read_guarded(
+        path,
+        label="checkpoint MCP",
+        max_bytes=FPCH_MCP_CHECKPOINT_MAX_BYTES,
+        limit_text="1 MiB",
+        consume=chunks.append,
+    )
+    return loads(b"".join(chunks))
+
+
+def _source_basename(source: str) -> str:
+    """Último segmento do caminho da ``source``; vazio se terminar em ``/``."""
+    return urlsplit(source).path.rsplit("/", 1)[-1]
+
+
+def _valid_basename(value: object) -> bool:
+    return (
+        type(value) is str
+        and bool(value)
+        and value not in (".", "..")
+        and not any(character in value for character in "/\\\x00")
+    )
+
+
+def _validate_verification(value: FpchMcpArtifactVerification) -> None:
+    """Recalcula cada veredito a partir dos dados; instância forjada falha."""
+    _validate_fields(value.name, value.source, value.version, value.expected_sha256)
+    if type(value.actual_sha256) is not str or _SHA256.fullmatch(value.actual_sha256) is None:
+        raise FpchMcpError("actual_sha256 de verificação MCP inválido")
+    if type(value.size_bytes) is not int or value.size_bytes < 0:
+        raise FpchMcpError("size_bytes de verificação MCP inválido")
+    if not _valid_basename(value.artifact_basename):
+        raise FpchMcpError("artifact_basename de verificação MCP inválido")
+    if (
+        type(value.expected_basename) is not str
+        or value.expected_basename != _source_basename(value.source)
+    ):
+        raise FpchMcpError("expected_basename de verificação MCP inválido")
+    for flag in ("digest_matches", "basename_matches", "verified"):
+        if type(getattr(value, flag)) is not bool:
+            raise FpchMcpError(f"{flag} de verificação MCP deve ser booleano")
+    digest_matches = hmac.compare_digest(
+        value.actual_sha256.encode("ascii"), value.expected_sha256.encode("ascii")
+    )
+    basename_matches = bool(value.expected_basename) and (
+        value.artifact_basename == value.expected_basename
+    )
+    if (
+        value.digest_matches is not digest_matches
+        or value.basename_matches is not basename_matches
+        or value.verified is not (digest_matches and basename_matches)
+    ):
+        raise FpchMcpError("verificação de artefato MCP inconsistente")
+
+
+@dataclass(frozen=True)
+class FpchMcpArtifactVerification:
+    """Resultado da conferência offline de um artefato local contra um checkpoint.
+
+    ``verified`` só é verdadeiro quando o SHA-256 dos bytes lidos coincide com
+    ``expected_sha256`` **e** o nome real da entrada em disco coincide
+    exatamente (inclusive maiúsculas e minúsculas) com o último segmento da
+    ``source``. Verificar não instala, não executa e não autoriza nada: é apenas
+    evidência para o autor. Os vereditos são recalculados na construção.
+    """
+
+    name: str
+    source: str
+    version: str
+    expected_sha256: str
+    actual_sha256: str
+    size_bytes: int
+    artifact_basename: str
+    expected_basename: str
+    digest_matches: bool
+    basename_matches: bool
+    verified: bool
+
+    def __post_init__(self) -> None:
+        _validate_verification(self)
+
+    def to_dict(self) -> dict[str, Any]:
+        """Representação compatível com JSON, com todos os campos do resultado."""
+        return {
+            "actual_sha256": self.actual_sha256,
+            "artifact_basename": self.artifact_basename,
+            "basename_matches": self.basename_matches,
+            "digest_matches": self.digest_matches,
+            "expected_basename": self.expected_basename,
+            "expected_sha256": self.expected_sha256,
+            "name": self.name,
+            "size_bytes": self.size_bytes,
+            "source": self.source,
+            "verified": self.verified,
+            "version": self.version,
+        }
+
+
+def dumps_verification(value: FpchMcpArtifactVerification) -> str:
+    """Revalida e serializa o resultado de verificação em JSON canônico."""
+    if type(value) is not FpchMcpArtifactVerification:
+        raise FpchMcpError(
+            "verificação de artefato MCP deve ser FpchMcpArtifactVerification"
+        )
+    _validate_verification(value)
+    return json.dumps(
+        value.to_dict(), ensure_ascii=True, sort_keys=True, separators=(",", ":")
+    ) + "\n"
+
+
+def verify_artifact(
+    checkpoint: FpchMcpInstallCheckpoint, path: str | Path
+) -> FpchMcpArtifactVerification:
+    """Confere bytes locais contra um checkpoint, sem rede, execução ou escrita.
+
+    Caminho inseguro (link ou reparse point no caminho ou em ancestral, arquivo
+    não regular, acima de ``FPCH_MCP_ARTIFACT_MAX_BYTES``, alterado durante a
+    leitura, nome em disco ambíguo ou erro de sistema) levanta
+    ``FpchMcpError``. Divergência de digest ou de nome devolve resultado com
+    ``verified=False``. O nome comparado é o da entrada real no diretório, não
+    o digitado: em sistema de arquivos que ignora caixa, ``x.tgz`` digitado
+    para ``X.TGZ`` gravado não confere.
+    """
+    validate(checkpoint)
+    hasher = hashlib.sha256()
+    read = _read_guarded(
+        path,
+        label="artefato MCP",
+        max_bytes=FPCH_MCP_ARTIFACT_MAX_BYTES,
+        limit_text="o limite de artefato",
+        consume=hasher.update,
+        want_disk_basename=True,
+    )
+    actual_sha256 = hasher.hexdigest()
+    artifact_basename = read.disk_basename or ""
+    expected_basename = _source_basename(checkpoint.source)
+    digest_matches = hmac.compare_digest(
+        actual_sha256.encode("ascii"), checkpoint.expected_sha256.encode("ascii")
+    )
+    basename_matches = bool(expected_basename) and (
+        artifact_basename == expected_basename
+    )
+    return FpchMcpArtifactVerification(
+        name=checkpoint.name,
+        source=checkpoint.source,
+        version=checkpoint.version,
+        expected_sha256=checkpoint.expected_sha256,
+        actual_sha256=actual_sha256,
+        size_bytes=read.size,
+        artifact_basename=artifact_basename,
+        expected_basename=expected_basename,
+        digest_matches=digest_matches,
+        basename_matches=basename_matches,
+        verified=digest_matches and basename_matches,
+    )

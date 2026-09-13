@@ -589,6 +589,45 @@ def _cmd_setup_apply(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_mcp_verify(args: argparse.Namespace) -> int:
+    """Confere um artefato local contra um checkpoint MCP; nunca escreve arquivos.
+
+    Sem rede, download, extração, execução ou instalação. Saída 0 = verificado;
+    1 = digest ou nome divergente; 2 = checkpoint ou caminho inseguro/inválido.
+    """
+    try:
+        checkpoint = mcp.load(Path(args.checkpoint))
+        result = mcp.verify_artifact(checkpoint, Path(args.artifact))
+        payload = mcp.dumps_verification(result)
+    except mcp.FpchMcpError as exc:
+        print(f"erro de verificação MCP: {_safe_cli_error(exc)}", file=sys.stderr)
+        return EXIT_USO
+
+    if args.json:
+        print(payload, end="")
+    else:
+
+        def situacao(ok: bool) -> str:
+            return "confere" if ok else "diverge"
+
+        print(f"artefato MCP: {'verificado' if result.verified else 'NÃO verificado'}")
+        print(f"nome: {result.name}")
+        print(f"versão: {result.version}")
+        print(f"source: {result.source}")
+        print(f"tamanho: {result.size_bytes} bytes")
+        print(f"sha256 esperado: {result.expected_sha256}")
+        print(f"sha256 obtido: {result.actual_sha256}")
+        print(f"digest: {situacao(result.digest_matches)}")
+        print(
+            f"nome do arquivo: {_safe_cli_error(result.artifact_basename)} "
+            f"(esperado: {result.expected_basename}) — "
+            f"{situacao(result.basename_matches)}"
+        )
+        print("nada foi instalado, executado ou gravado")
+
+    return 0 if result.verified else 1
+
+
 def _cmd_audit(args: argparse.Namespace) -> int:
     trilha = Path(args.trilha) if getattr(args, "trilha", None) else None
 
@@ -1012,6 +1051,21 @@ def build_parser() -> argparse.ArgumentParser:
         help="trilha de auditoria a usar nesta aplicação",
     )
     suap.set_defaults(fn=_cmd_setup_apply)
+
+    mc = sub.add_parser(
+        "mcp",
+        help="operações offline sobre checkpoints MCP (sem rede nem instalação)",
+    )
+    mcsub = mc.add_subparsers(dest="mcp_cmd", required=True)
+
+    mcve = mcsub.add_parser(
+        "verify",
+        help="confere um artefato já obtido localmente contra um checkpoint MCP",
+    )
+    mcve.add_argument("checkpoint", metavar="CHECKPOINT", help="checkpoint MCP em JSON")
+    mcve.add_argument("artifact", metavar="ARTEFATO", help="arquivo local do artefato")
+    mcve.add_argument("--json", action="store_true", help="emite o resultado em JSON canônico")
+    mcve.set_defaults(fn=_cmd_mcp_verify)
 
     au = sub.add_parser("audit", help="resumo de uso por pool")
     au.add_argument("--verify", action="store_true",
