@@ -60,6 +60,7 @@ from . import (
     hooks,
     improve,
     interview,
+    mcp,
     models,
     policy,
     quotes,
@@ -489,10 +490,21 @@ def _cmd_setup_plan(args: argparse.Namespace) -> int:
             else Path(args.answers)
         )
         preferences = interview.load_answers(source)
-        setup_plan = setup.plan(report, preferences)
+        checkpoints = tuple(
+            mcp.load(Path(checkpoint_path))
+            for checkpoint_path in (args.mcp_checkpoint or ())
+        )
+        setup_plan = setup.plan(
+            report,
+            preferences,
+            mcp_checkpoints=checkpoints,
+        )
         payload = setup.dumps(setup_plan)
     except interview.FpchInterviewError as exc:
         print(f"erro de entrevista: {_safe_cli_error(exc)}", file=sys.stderr)
+        return EXIT_USO
+    except mcp.FpchMcpError as exc:
+        print(f"erro de checkpoint MCP: {_safe_cli_error(exc)}", file=sys.stderr)
         return EXIT_USO
     except setup.FpchSetupError as exc:
         print(f"erro de plano: {_safe_cli_error(exc)}", file=sys.stderr)
@@ -512,15 +524,16 @@ def _cmd_setup_plan(args: argparse.Namespace) -> int:
         print(f"repositório: {setup_plan.repo}")
         print(f"artefatos: {len(setup_plan.artifacts)}")
         print(f"conflitos: {len(setup_plan.conflicts)}")
+        print(f"checkpoints MCP: {len(setup_plan.mcp_install_checkpoints)}")
         print(f"MCPs não resolvidos: {len(setup_plan.unresolved_mcps)}")
         for conflict in setup_plan.conflicts:
             print(f"  conflito: {conflict.path} — {conflict.reason}")
-        for mcp in setup_plan.unresolved_mcps:
-            print(f"  MCP bloqueado: {mcp}")
+        for unresolved_mcp in setup_plan.unresolved_mcps:
+            print(f"  MCP bloqueado: {unresolved_mcp}")
         if args.output is not None:
             print(f"arquivo criado: {Path(args.output)}")
 
-    return 1 if setup_plan.conflicts else 0
+    return 0 if setup_plan.is_applicable else 1
 
 
 def _cmd_setup_apply(args: argparse.Namespace) -> int:
@@ -966,6 +979,15 @@ def build_parser() -> argparse.ArgumentParser:
         help="respostas C3 em JSON, de um arquivo ou de stdin com '-'",
     )
     supl.add_argument("--json", action="store_true", help="emite o plano canônico em JSON")
+    supl.add_argument(
+        "--mcp-checkpoint",
+        metavar="CAMINHO",
+        action="append",
+        help=(
+            "inclui checkpoint MCP declarativo no plano; pode ser repetido e "
+            "mantém a aplicação bloqueada"
+        ),
+    )
     supl.add_argument(
         "--output",
         metavar="CAMINHO",

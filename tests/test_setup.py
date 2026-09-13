@@ -11,7 +11,7 @@ from pathlib import Path
 
 import pytest
 
-from fpch import audit, setup
+from fpch import audit, mcp, setup
 from fpch.discovery import FpchDiscoveryReport, discover
 from fpch.interview import FpchInterviewPreferences
 
@@ -35,8 +35,31 @@ def _preferences() -> FpchInterviewPreferences:
     )
 
 
-def _plan(root: Path) -> setup.FpchSetupPlan:
-    return setup.plan(_report(root), _preferences())
+def _checkpoint(
+    name: str = "server-filesystem",
+    *,
+    source: str | None = None,
+    version: str = "1.2.3",
+    expected_sha256: str = "a" * 64,
+) -> mcp.FpchMcpInstallCheckpoint:
+    return mcp.FpchMcpInstallCheckpoint(
+        name=name,
+        source=source
+        or f"https://packages.example.test/mcp/{name}/{version}.tgz",
+        version=version,
+        expected_sha256=expected_sha256,
+    )
+
+
+def _plan(
+    root: Path,
+    mcp_checkpoints: tuple[mcp.FpchMcpInstallCheckpoint, ...] = (),
+) -> setup.FpchSetupPlan:
+    return setup.plan(
+        _report(root),
+        _preferences(),
+        mcp_checkpoints=mcp_checkpoints,
+    )
 
 
 def test_plan_is_deterministic_canonical_and_roundtrips(tmp_path: Path) -> None:
@@ -46,6 +69,7 @@ def test_plan_is_deterministic_canonical_and_roundtrips(tmp_path: Path) -> None:
     assert first == second
     assert first.plan_id == second.plan_id
     assert len(first.plan_id) == 64
+    assert first.mcp_install_checkpoints == ()
     assert [item.path for item in first.artifacts] == [
         "AGENTS.md",
         "CLAUDE.md",
@@ -60,6 +84,7 @@ def test_plan_is_deterministic_canonical_and_roundtrips(tmp_path: Path) -> None:
 
     encoded = setup.dumps(first)
     assert encoded.endswith("\n")
+    assert json.loads(encoded)["schema_version"] == 2
     assert encoded == json.dumps(
         json.loads(encoded),
         ensure_ascii=False,
@@ -85,10 +110,156 @@ def test_generated_control_layer_uses_only_bounded_context(tmp_path: Path) -> No
     assert _report(tmp_path).repo not in agents
     assert "pytest" not in agents  # dependências são contadas, não injetadas como instrução
     assert manifest["generator"] == "fpch"
+    assert manifest["schema_version"] == 1
     assert [item["path"] for item in manifest["managed_files"]] == [
         "AGENTS.md",
         "CLAUDE.md",
     ]
+
+
+def test_mcp_checkpoints_are_sorted_bound_to_plan_and_roundtrip(
+    tmp_path: Path,
+) -> None:
+    second = _checkpoint("server-zeta", expected_sha256="b" * 64)
+    first = _checkpoint("server-alpha", expected_sha256="c" * 64)
+    before = tuple(tmp_path.iterdir())
+
+    value = _plan(tmp_path, (second, first))
+
+    assert value.mcp_install_checkpoints == (first, second)
+    assert not value.is_applicable
+    assert tuple(tmp_path.iterdir()) == before
+    payload = json.loads(setup.dumps(value))
+    assert payload["schema_version"] == 2
+    assert payload["mcp_install_checkpoints"] == [
+        {
+            "expected_sha256": first.expected_sha256,
+            "name": first.name,
+            "source": first.source,
+            "version": first.version,
+        },
+        {
+            "expected_sha256": second.expected_sha256,
+            "name": second.name,
+            "source": second.source,
+            "version": second.version,
+        },
+    ]
+    assert setup.loads(setup.dumps(value)) == value
+
+
+def test_mcp_checkpoint_container_and_names_are_unambiguous(tmp_path: Path) -> None:
+    checkpoint = _checkpoint()
+    with pytest.raises(setup.FpchSetupError, match="tupla"):
+        setup.plan(
+            _report(tmp_path),
+            _preferences(),
+            mcp_checkpoints=[checkpoint],  # type: ignore[arg-type]
+        )
+
+    with pytest.raises(setup.FpchSetupError, match="checkpoint MCP inválido"):
+        setup.plan(
+            _report(tmp_path),
+            _preferences(),
+            mcp_checkpoints=(object(),),  # type: ignore[arg-type]
+        )
+
+    duplicate = _checkpoint(
+        source="https://mirror.example.test/mcp/server-filesystem/1.2.3.tgz",
+        expected_sha256="d" * 64,
+    )
+    with pytest.raises(setup.FpchSetupError, match="únicos"):
+        _plan(tmp_path, (checkpoint, duplicate))
+
+
+def test_every_mcp_checkpoint_field_is_bound_to_plan_id(tmp_path: Path) -> None:
+    shared_source = (
+        "https://packages.example.test/mcp/server-filesystem/server-memory/"
+        "1.2.3/1.2.4.tgz"
+    )
+    baseline = _checkpoint(source=shared_source)
+    baseline_plan = _plan(tmp_path, (baseline,))
+    alternatives = (
+        _checkpoint("server-memory", source=shared_source),
+        _checkpoint(
+            source="https://mirror.example.test/mcp/server-filesystem/1.2.3.tgz"
+        ),
+        _checkpoint(version="1.2.4", source=shared_source),
+        _checkpoint(expected_sha256="e" * 64),
+    )
+
+    assert {
+        _plan(tmp_path, (checkpoint,)).plan_id for checkpoint in alternatives
+    }.isdisjoint({baseline_plan.plan_id})
+
+    tampered = dataclasses.replace(
+        baseline_plan,
+        mcp_install_checkpoints=(alternatives[-1],),
+    )
+    with pytest.raises(setup.FpchSetupError, match="plan_id"):
+        setup.dumps(tampered)
+
+
+def test_loads_rejects_open_mcp_checkpoint_schema(tmp_path: Path) -> None:
+    payload = json.loads(setup.dumps(_plan(tmp_path, (_checkpoint(),))))
+    payload["mcp_install_checkpoints"][0]["unknown"] = True
+
+    with pytest.raises(setup.FpchSetupError, match="campos inválidos"):
+        setup.loads(json.dumps(payload))
+
+
+def test_plan_and_dumps_reject_wire_payload_over_limit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    value = _plan(tmp_path)
+    encoded_size = len(setup.dumps(value).encode("utf-8"))
+    monkeypatch.setattr(setup, "FPCH_SETUP_MAX_BYTES", encoded_size - 1)
+
+    with pytest.raises(setup.FpchSetupError, match="excede"):
+        setup.dumps(value)
+    with pytest.raises(setup.FpchSetupError, match="excede"):
+        _plan(tmp_path)
+
+
+@pytest.mark.parametrize("schema_version", (1, 999))
+def test_loads_reports_unsupported_schema_before_closed_keys(
+    tmp_path: Path, schema_version: int
+) -> None:
+    payload = json.loads(setup.dumps(_plan(tmp_path)))
+    payload["schema_version"] = schema_version
+    payload["field_from_another_schema"] = True
+    payload.pop("mcp_install_checkpoints")
+
+    with pytest.raises(setup.FpchSetupError, match="schema_version.*não suportada"):
+        setup.loads(json.dumps(payload))
+
+
+def test_apply_with_mcp_checkpoint_is_blocked_before_any_write(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    value = _plan(tmp_path, (_checkpoint(),))
+    trail = tmp_path / "audit.jsonl"
+
+    assert not value.is_applicable
+
+    monkeypatch.setattr(
+        setup,
+        "_ensure_fpch_dir",
+        lambda *_args, **_kwargs: pytest.fail("apply não pode iniciar transação MCP"),
+    )
+    monkeypatch.setattr(
+        setup.audit,
+        "write",
+        lambda *_args, **_kwargs: pytest.fail("apply MCP não pode auditar instalação"),
+    )
+
+    with pytest.raises(setup.FpchSetupError, match="MCP"):
+        setup.apply(value, value.plan_id, trail)
+
+    assert not (tmp_path / "AGENTS.md").exists()
+    assert not (tmp_path / "CLAUDE.md").exists()
+    assert not (tmp_path / ".fpch").exists()
+    assert not trail.exists()
 
 
 def test_apply_requires_confirmation_without_mutating(tmp_path: Path) -> None:

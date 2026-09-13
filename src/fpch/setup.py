@@ -36,8 +36,12 @@ from .interview import (
     FpchInterviewPreferences,
     loads as load_interview,
 )
+from .mcp import FpchMcpError, FpchMcpInstallCheckpoint, validate as validate_mcp
 
-FPCH_SETUP_SCHEMA_VERSION = 1
+FPCH_SETUP_PLAN_SCHEMA_VERSION = 2
+FPCH_SETUP_MANIFEST_SCHEMA_VERSION = 1
+# Compatibilidade para consumidores que usavam a constante do wire plan.
+FPCH_SETUP_SCHEMA_VERSION = FPCH_SETUP_PLAN_SCHEMA_VERSION
 FPCH_SETUP_MAX_BYTES = 1024 * 1024
 FPCH_SETUP_EXISTING_MAX_BYTES = 1024 * 1024
 
@@ -113,8 +117,16 @@ class FpchSetupPlan:
     repo_identity: FpchRepoIdentity
     artifacts: tuple[FpchPlannedArtifact, ...]
     conflicts: tuple[FpchSetupConflict, ...]
+    mcp_install_checkpoints: tuple[FpchMcpInstallCheckpoint, ...]
     unresolved_mcps: tuple[str, ...]
     plan_id: str
+
+    @property
+    def is_applicable(self) -> bool:
+        """Indica se o plano pode alcançar a transação local nesta fatia."""
+        return not (
+            self.conflicts or self.mcp_install_checkpoints or self.unresolved_mcps
+        )
 
 
 @dataclass(frozen=True)
@@ -387,7 +399,7 @@ def _manifest_content(
             }
             for artifact in managed
         ],
-        "schema_version": FPCH_SETUP_SCHEMA_VERSION,
+        "schema_version": FPCH_SETUP_MANIFEST_SCHEMA_VERSION,
     }
     return _canonical_json(payload, newline=True)
 
@@ -520,6 +532,17 @@ def _artifact_dict(artifact: FpchPlannedArtifact) -> dict[str, object]:
     }
 
 
+def _mcp_checkpoint_dict(
+    checkpoint: FpchMcpInstallCheckpoint,
+) -> dict[str, object]:
+    return {
+        "expected_sha256": checkpoint.expected_sha256,
+        "name": checkpoint.name,
+        "source": checkpoint.source,
+        "version": checkpoint.version,
+    }
+
+
 def _logical_plan_dict(value: FpchSetupPlan) -> dict[str, object]:
     return {
         "artifacts": [_artifact_dict(item) for item in value.artifacts],
@@ -528,9 +551,12 @@ def _logical_plan_dict(value: FpchSetupPlan) -> dict[str, object]:
         "discovery_sha256": value.discovery_sha256,
         "interview_snapshot": json.loads(value.interview_snapshot),
         "interview_sha256": value.interview_sha256,
+        "mcp_install_checkpoints": [
+            _mcp_checkpoint_dict(item) for item in value.mcp_install_checkpoints
+        ],
         "repo": value.repo,
         "repo_identity": asdict(value.repo_identity),
-        "schema_version": FPCH_SETUP_SCHEMA_VERSION,
+        "schema_version": FPCH_SETUP_PLAN_SCHEMA_VERSION,
         "unresolved_mcps": list(value.unresolved_mcps),
     }
 
@@ -615,8 +641,21 @@ def _validate_plan(value: FpchSetupPlan) -> None:
     }
     if state_conflicts != set(conflict_by_path):
         raise FpchSetupError("estados conflict não correspondem à lista de conflitos")
+    if type(value.mcp_install_checkpoints) is not tuple:
+        raise FpchSetupError("mcp_install_checkpoints deve ser tupla")
+    checkpoint_names: list[str] = []
+    for checkpoint in value.mcp_install_checkpoints:
+        try:
+            validate_mcp(checkpoint)
+        except FpchMcpError as exc:
+            raise FpchSetupError("checkpoint MCP inválido no plano") from exc
+        checkpoint_names.append(checkpoint.name)
+    if checkpoint_names != sorted(checkpoint_names):
+        raise FpchSetupError("checkpoints MCP devem estar ordenados por name")
+    if len(checkpoint_names) != len(set(checkpoint_names)):
+        raise FpchSetupError("names de checkpoint MCP devem ser únicos")
     if type(value.unresolved_mcps) is not tuple or value.unresolved_mcps:
-        raise FpchSetupError("C4a não aceita instalações MCP")
+        raise FpchSetupError("unresolved_mcps deve permanecer vazio")
     if not _is_sha256(value.plan_id) or value.plan_id != _computed_plan_id(value):
         raise FpchSetupError("plan_id não corresponde ao conteúdo do plano")
 
@@ -624,12 +663,27 @@ def _validate_plan(value: FpchSetupPlan) -> None:
 def plan(
     report: FpchDiscoveryReport,
     preferences: FpchInterviewPreferences,
+    *,
+    mcp_checkpoints: tuple[FpchMcpInstallCheckpoint, ...] = (),
 ) -> FpchSetupPlan:
     """Produz plano determinístico sem escrever ou executar qualquer ferramenta."""
     if not isinstance(report, FpchDiscoveryReport):
         raise FpchSetupError("report deve ser FpchDiscoveryReport")
     if not isinstance(preferences, FpchInterviewPreferences):
         raise FpchSetupError("preferences deve ser FpchInterviewPreferences")
+    if type(mcp_checkpoints) is not tuple:
+        raise FpchSetupError("mcp_checkpoints deve ser tupla")
+    checkpoints: list[FpchMcpInstallCheckpoint] = []
+    for checkpoint in mcp_checkpoints:
+        try:
+            validate_mcp(checkpoint)
+        except FpchMcpError as exc:
+            raise FpchSetupError("checkpoint MCP inválido") from exc
+        checkpoints.append(checkpoint)
+    checkpoints.sort(key=lambda item: item.name)
+    checkpoint_names = [item.name for item in checkpoints]
+    if len(checkpoint_names) != len(set(checkpoint_names)):
+        raise FpchSetupError("names de checkpoint MCP devem ser únicos")
     root = _validated_root(report.repo)
     discovery_snapshot = _canonical_json(report.as_dict())
     interview_snapshot = _canonical_json(preferences.as_dict())
@@ -667,6 +721,7 @@ def plan(
         repo_identity=_root_identity(root),
         artifacts=tuple(observed),
         conflicts=tuple(conflicts),
+        mcp_install_checkpoints=tuple(checkpoints),
         unresolved_mcps=(),
         plan_id="",
     )
@@ -679,10 +734,12 @@ def plan(
         repo_identity=draft.repo_identity,
         artifacts=draft.artifacts,
         conflicts=draft.conflicts,
+        mcp_install_checkpoints=draft.mcp_install_checkpoints,
         unresolved_mcps=draft.unresolved_mcps,
         plan_id=_computed_plan_id(draft),
     )
-    _validate_plan(result)
+    # ``plan`` nunca entrega um objeto que o próprio wire format recusaria.
+    dumps(result)
     return result
 
 
@@ -691,7 +748,14 @@ def dumps(value: FpchSetupPlan) -> str:
     _validate_plan(value)
     payload = _logical_plan_dict(value)
     payload["plan_id"] = value.plan_id
-    return _canonical_json(payload, newline=True)
+    encoded = _canonical_json(payload, newline=True)
+    try:
+        size = len(encoded.encode("utf-8", errors="strict"))
+    except UnicodeEncodeError as exc:
+        raise FpchSetupError("plano contém Unicode inválido") from exc
+    if size > FPCH_SETUP_MAX_BYTES:
+        raise FpchSetupError("plano excede 1 MiB")
+    return encoded
 
 
 def _closed_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
@@ -737,6 +801,14 @@ def loads(raw: str | bytes) -> FpchSetupPlan:
     except (json.JSONDecodeError, RecursionError) as exc:
         raise FpchSetupError(f"JSON de plano inválido: {exc}") from exc
 
+    if not isinstance(payload, dict):
+        raise FpchSetupError("plano deve ser objeto JSON")
+    if "schema_version" in payload and (
+        type(payload["schema_version"]) is not int
+        or payload["schema_version"] != FPCH_SETUP_PLAN_SCHEMA_VERSION
+    ):
+        raise FpchSetupError("schema_version de plano não suportada")
+
     top = _exact_keys(
         payload,
         {
@@ -746,6 +818,7 @@ def loads(raw: str | bytes) -> FpchSetupPlan:
             "discovery_sha256",
             "interview_snapshot",
             "interview_sha256",
+            "mcp_install_checkpoints",
             "plan_id",
             "repo",
             "repo_identity",
@@ -754,8 +827,6 @@ def loads(raw: str | bytes) -> FpchSetupPlan:
         },
         "plano",
     )
-    if type(top["schema_version"]) is not int or top["schema_version"] != 1:
-        raise FpchSetupError("schema_version de plano não suportada")
     if not isinstance(top["artifacts"], list):
         raise FpchSetupError("artifacts deve ser lista JSON")
     artifacts: list[FpchPlannedArtifact] = []
@@ -792,6 +863,26 @@ def loads(raw: str | bytes) -> FpchSetupPlan:
         )
     if not isinstance(top["unresolved_mcps"], list):
         raise FpchSetupError("unresolved_mcps deve ser lista JSON")
+    if not isinstance(top["mcp_install_checkpoints"], list):
+        raise FpchSetupError("mcp_install_checkpoints deve ser lista JSON")
+    checkpoints: list[FpchMcpInstallCheckpoint] = []
+    for raw_checkpoint in top["mcp_install_checkpoints"]:
+        item = _exact_keys(
+            raw_checkpoint,
+            {"expected_sha256", "name", "source", "version"},
+            "checkpoint MCP",
+        )
+        try:
+            checkpoints.append(
+                FpchMcpInstallCheckpoint(
+                    name=item["name"],
+                    source=item["source"],
+                    version=item["version"],
+                    expected_sha256=item["expected_sha256"],
+                )
+            )
+        except FpchMcpError as exc:
+            raise FpchSetupError("checkpoint MCP inválido no plano") from exc
     identity_payload = _exact_keys(
         top["repo_identity"],
         {"device", "inode", "mode"},
@@ -810,6 +901,7 @@ def loads(raw: str | bytes) -> FpchSetupPlan:
         ),
         artifacts=tuple(artifacts),
         conflicts=tuple(conflicts),
+        mcp_install_checkpoints=tuple(checkpoints),
         unresolved_mcps=tuple(top["unresolved_mcps"]),
         plan_id=top["plan_id"],
     )
@@ -1392,6 +1484,10 @@ def apply(
     rollback e torna a operação um erro explícito.
     """
     _validate_plan(value)
+    if value.mcp_install_checkpoints:
+        raise FpchSetupError(
+            "plano contém checkpoint MCP; instalação permanece bloqueada"
+        )
     if type(confirmation) is not str or confirmation != value.plan_id:
         raise FpchSetupError("confirmação deve ser exatamente o plan_id")
     root = _validated_root(value.repo)
