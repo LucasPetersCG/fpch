@@ -1,10 +1,10 @@
-# FPCH — PoC (C1–C4a)
+# FPCH — PoC (C1–C4a + C16/C7)
 
 > 🧭 **Mapa de docs:** [`AGENTS.md`](../AGENTS.md) · [`docs/PROJECT.md`](../docs/PROJECT.md) · [`docs/STATUS.md`](../docs/STATUS.md) · [`TODO.md`](../TODO.md) · [`docs/analises/fpch-evidencias-desenvolvimento.md`](../docs/analises/fpch-evidencias-desenvolvimento.md) · [`docs/analises/camada-multi-modelo.md`](../docs/analises/camada-multi-modelo.md) · [`docs/referencias/estado-da-arte-2026-07.md`](../docs/referencias/estado-da-arte-2026-07.md)
 
-Código do FPCH. Nasceu cobrindo **C1** (camada de acesso multi-modelo) e a ferramenta **cannibalize**; desde a fatia funcional de 01/09/2026 instancia **as cinco camadas do framework** — política (`policy.py`), hooks determinísticos (`hooks.py`), laço de autoaprimoramento (`improve.py`), trilha verificável (`audit.py` + `fpch audit --verify`) e acesso multi-modelo (`router.py`/`backends.py`/`models.py`). Em 09/09/2026, C2 acrescentou a exploração automática em `discovery.py`, C3 a captura explícita de preferências em `interview.py` e C4a o setup local com transação compensatória journalada em `setup.py`. **15 módulos, 8.747 linhas físicas de código; 16 arquivos e 5.810 linhas físicas de testes; 402 testes passando e 6 ignorados** (medido em 09/09/2026).
+Código do FPCH. Nasceu cobrindo **C1** (camada de acesso multi-modelo) e a ferramenta **cannibalize**; desde a fatia funcional de 01/09/2026 instancia **as cinco camadas do framework** — política (`policy.py`), hooks determinísticos (`hooks.py`), laço de autoaprimoramento (`improve.py`), trilha verificável (`audit.py` + `fpch audit --verify`) e acesso multi-modelo (`router.py`/`backends.py`/`models.py`). Em 09/09/2026, C2 acrescentou a exploração automática em `discovery.py`, C3 a captura explícita de preferências em `interview.py` e C4a o setup local com transação compensatória journalada em `setup.py`; em 13/09/2026, C16 acrescentou o checkpoint MCP declarativo em `mcp.py` e, no mesmo dia, um segundo corte acrescentou ao mesmo módulo a verificação offline de artefato MCP (`verify_artifact`). **16 módulos, 9.488 linhas físicas de código; 18 arquivos e 7.024 linhas físicas de testes; 518 testes passando e 10 ignorados em 8,65 s** (medido em 13/09/2026).
 
-**Status:** C1 funcional e verificado ponta a ponta desde 16/07/2026; C2 e C3 concluídas em 09/09/2026; C4a implementada como fatia parcial local. C4 continua aberta e MCP externo está bloqueado por C16/C7. Stack: **Python ≥3.11 + uv**. Zero dependências de runtime — só a stdlib e os CLIs oficiais já instalados.
+**Status:** C1 funcional e verificado ponta a ponta desde 16/07/2026; C2 e C3 concluídas em 09/09/2026; C16 concluída em 13/09/2026; C4a implementada como fatia parcial local. C4 e C7 permanecem parciais: o plano aceita checkpoints MCP e `fpch mcp verify` confere o artefato obtido localmente contra o checkpoint, mas aplicação, consumo ligado ao `apply` e instalação continuam bloqueados. Stack: **Python ≥3.11 + uv**. Zero dependências de runtime — só a stdlib e os CLIs oficiais já instalados.
 
 ## Uso
 
@@ -16,7 +16,9 @@ uv run fpch interview .               # captura preferências explícitas em TTY
 uv run fpch interview . --answers preferences.json --json
 uv run fpch interview . --answers - --output preferences.json
 uv run fpch setup plan . --answers preferences.json --json --output fpch-setup-plan.json
+uv run fpch setup plan . --answers preferences.json --mcp-checkpoint filesystem.json --json
 uv run fpch setup apply fpch-setup-plan.json --confirm <plan_id>
+uv run fpch mcp verify filesystem.json artefato.bin --json  # confere SHA-256 + nome de arquivo, offline
 uv run fpch ask standard "prompt"     # roteia
 uv run fpch ask hard --file spec.md   # prompt longo vem de arquivo
 uv run fpch audit                     # para onde a cota foi
@@ -43,15 +45,29 @@ O comando é offline: não executa subprocessos, não usa rede, não instala com
 
 O smoke test real foi não interativo e usou **respostas sintéticas** (`context-mode:ctx-search`, `ruff`, `black`), não preferências do autor; também não forneceu `--output`, portanto não persistiu arquivo. C4a agora consome essas respostas apenas para planejar e criar artefatos locais conhecidos.
 
-## Setup local com transação compensatória (`setup`) — C4a parcial
+## Setup local e checkpoint MCP declarativo (`setup`) — C4/C7 parciais
 
 `fpch setup plan <repo> --answers PATH|- [--json] [--output PATH]` redescobre o repositório, valida respostas C3 e produz um plano canônico para `AGENTS.md`, `CLAUDE.md` e `.fpch/setup-manifest.json`. O plano contém os snapshots C2/C3 e seus hashes, a identidade física da raiz, o conteúdo e estado de cada artefato e um `plan_id` que cobre o contrato inteiro. Planejar é somente leitura no alvo; `--output` apenas cria explicitamente um arquivo de plano e nunca o sobrescreve.
 
 `fpch setup apply PLAN_PATH --confirm PLAN_ID [--trilha CAMINHO]` exige confirmação literal do `plan_id`, revalida a identidade da raiz, repete C2 e compara o snapshot, além de conferir novamente os estados dos artefatos. A aplicação é *create-only*: conteúdo igual fica `unchanged`, conteúdo diferente ou caminho inseguro vira conflito e nada é sobrescrito.
 
+`--mcp-checkpoint CAMINHO` pode ser repetido no comando `plan`. Cada arquivo deve conter exatamente `name`, `source`, `version` e `expected_sha256` em JSON; o loader impõe 1 MiB, esquema fechado, URL HTTPS canônica/coerente e contenção de *links/reparse points* com snapshot. Todos os campos entram no `plan_id`, e a ordenação canônica mantém o mesmo conjunto determinístico. Planejar continua offline e *plan-only*.
+
 A transação usa *lock* e *journal* em `.fpch/`, com criação exclusiva e `fsync` a cada mudança de estado. Em falha antes da auditoria, arquivos ainda idênticos aos criados pela transação são movidos para quarentena e removidos em ordem inversa; falha ao gravar o evento `install` também aciona rollback. O evento registra uma inversa estruturada, mas `fpch undo` ainda não existe (C25). `audit.write` serializa escritores por *lock* de thread e processo e só confirma após `fsync` do arquivo e, quando suportado, do diretório.
 
-O regime suportado é **trusted single writer**. Uma troca hostil de ancestrais durante chamadas ao sistema fica fora do modelo; alterações detectadas falham fechadas. Se houver interrupção no intervalo ambíguo em que a auditoria pode ter sido escrita, o estado `auditing` exige recuperação explícita, pois repetir ou desfazer automaticamente poderia falsificar o resultado. C4a não instala ferramentas nem MCPs externos: essa parte permanece bloqueada até C16/C7 fornecerem verificação determinística de nome, fonte e versão. C4, C15, C17, C23 e C25 continuam abertas.
+O regime suportado é **trusted single writer**. Uma troca hostil de ancestrais durante chamadas ao sistema fica fora do modelo; alterações detectadas falham fechadas. Se houver interrupção no intervalo ambíguo em que a auditoria pode ter sido escrita, o estado `auditing` exige recuperação explícita, pois repetir ou desfazer automaticamente poderia falsificar o resultado. Um plano com checkpoint MCP é recusado por `setup.apply` antes de qualquer mutação: não há *download*, rede, resolução, execução, instalação nem catálogo C15. C16 está concluída; C4 e C7 permanecem parciais; C15, C17, C23 e C25 continuam abertos.
+
+### Verificação offline de artefato MCP (`mcp verify`) — 2º corte de C7
+
+`fpch mcp verify <checkpoint.json> <artefato> [--json]` confere um artefato MCP que o operador já obteve localmente contra o checkpoint declarativo de C16, sem tocar rede. A API em `mcp.py` é `verify_artifact(checkpoint, path) -> FpchMcpArtifactVerification` e `dumps_verification`; o teto de leitura é `FPCH_MCP_ARTIFACT_MAX_BYTES` = **256 MiB**. Códigos de saída: **0** verificado; **1** *digest* ou nome de arquivo divergente do checkpoint (o resultado ainda é impresso); **2** checkpoint inválido, caminho inseguro ou erro de leitura.
+
+A verificação faz dois testes independentes: um *hash* SHA-256 por *streaming*, comparado por `hmac.compare_digest` contra `expected_sha256`; e o nome do arquivo tal como gravado em disco — obtido via `os.scandir` mais identidade de *stat*, não pelo argumento de linha de comando — que precisa igualar exatamente, inclusive em maiúsculas/minúsculas, o último segmento de `source`.
+
+O endurecimento reaproveita e compartilha com `load` o mesmo leitor defensivo: caminho absoluto obtido lexicamente (`abspath`, sem seguir o sistema de arquivos via `resolve`); recusa de *links*, *junctions* e demais *reparse points* no caminho e em cada ancestral, checados antes e depois da leitura; comparação de *snapshot* do arquivo entre as duas checagens; `ValueError` (NUL embutido no caminho) convertido em `FpchMcpError`; e um objeto de resultado que revalida seus campos e recalcula as próprias *flags* na construção, de modo que uma instância forjada ou adulterada por fora falhe, inclusive em `dumps_verification`.
+
+O que este corte **não** faz: acessar rede, baixar, resolver URL, executar, extrair, instalar ou escrever. `setup.apply` continua recusando qualquer plano com checkpoint MCP, independentemente de uma verificação bem-sucedida — `verified=True` prova que os bytes batem com o checkpoint, não que a fonte é confiável.
+
+**Limites residuais:** uma reescrita *in-place* que preserve tamanho e restaure `mtime` não é detectada pela comparação de *snapshot*; janela pequena entre a última checagem de ancestral e o fechamento do arquivo; *hardlinks* para o mesmo conteúdo são aceitos; o Windows não oferece `O_NOFOLLOW` (mitigado por checagem de identidade pós-abertura); nomes curtos 8.3 do Windows e *hardlinks* que só diferem em caixa são recusados; sem garantia formal contra escritor local concorrente. Em aberto para o autor decidir, não para o agente: *allowlist*, catálogo (C15) e se ligar a verificação a `setup apply` como precondição. Candidato ao próximo corte, não compromisso: varredura determinística de Unicode oculto em metadados/manifesto MCP (blocos TAG, arXiv:2607.05744; caracteres *bidi*/largura zero).
 
 Canibalizar um artefato de terceiro:
 
@@ -88,6 +104,7 @@ Essa é a linha real entre uso pretendido e banimento: o ilícito é **mentir so
 
 - Defaults: `sandbox=True`, `allow_write=False`. Sub-agente que só pesquisa não escreve.
 - `subprocess` sempre com **lista de argumentos**, `shell=False`. (Não é teórico: o `Start-Process` do PowerShell estropiou um prompt multi-linha nesta mesma sessão.)
+- Checkpoint MCP é intenção verificável, não autorização: o plano inclui nome, fonte, versão e SHA-256 no `plan_id`, e a aplicação falha fechada antes de mutar.
 - Output de sub-agente é **dado não-confiável**, nunca instrução para o host.
 - `cannibalize` ingere conteúdo **hostil por premissa** — um README pode tentar sequestrar quem o lê. Por isso: sandbox, output vira ficha `.md` (dado, não execução), e a adoção é proposta que o autor aplica à mão.
 
@@ -111,4 +128,5 @@ Essa é a linha real entre uso pretendido e banimento: o ilícito é **mentir so
 - `gemini` CLI **inutilizável** nesta conta (`IneligibleTierError`) — não está no catálogo.
 - `ollama` e `litellm` **não instalados** — a camada API-key (LiteLLM) ainda não existe. Só a camada assinatura está implementada.
 - Custo/potência dos modelos são **juízo do autor**, não medição. O audit log existe justamente para substituir isso por dado.
-- ~~Sem testes automatizados ainda.~~ **Superado:** 402 testes aprovados e 6 ignorados em `tests/` (16 arquivos, 5.810 linhas), `uv run --with pytest pytest tests/ -q`, medidos em 09/09/2026. *Skip* não conta como aprovação; o detalhamento reproduzível fica em [`docs/analises/fpch-evidencias-desenvolvimento.md`](../docs/analises/fpch-evidencias-desenvolvimento.md). Os demais limites desta lista são de 16/07/2026 e não foram reconferidos.
+- ~~Sem testes automatizados ainda.~~ **Superado:** 518 testes aprovados e 10 ignorados em `tests/` (18 arquivos, 7.024 linhas), `uv run --with pytest pytest tests/ -q`, medidos em 13/09/2026. *Skip* não conta como aprovação; o detalhamento reproduzível fica em [`docs/analises/fpch-evidencias-desenvolvimento.md`](../docs/analises/fpch-evidencias-desenvolvimento.md). Os demais limites desta lista são de 16/07/2026 e não foram reconferidos.
+- O loader de checkpoint e o verificador de artefato (`mcp verify`) recusam *links/reparse points* e comparam snapshots, mas não oferecem segurança formal contra escritor local concorrente nem *traversal* por *handles*; *hardlinks* são aceitos e o Windows não tem `O_NOFOLLOW`.
