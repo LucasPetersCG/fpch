@@ -41,8 +41,47 @@ ele deixou de ser é a *única* barreira.
 
 Isto não é rigor decorativo. Este módulo declara acima que o conteúdo ingerido é
 hostil por premissa; um portão que só existe na interface protege a premissa
-apenas contra o usuário distraído, nunca contra o código que o contorna — que é
-exatamente o anti-padrão que o trabalho condena ao tratar de agentes com escrita.
+apenas contra o usuário distraído e nem sequer vê o código que entra por outra
+porta — que é exatamente o anti-padrão que o trabalho condena ao tratar de agentes
+com escrita. (O que o portão da fronteira de fato cobre, e o que não cobre, está
+em «O LIMITE», abaixo.)
+
+O portão confere o REGISTRO PERSISTIDO, não o objeto em memória. Conferir só
+`target.status` repetia o erro um nível abaixo: `Target(url=..., status="accepted")`
+ou `dataclasses.replace(t, status="accepted")` fabricam uma aprovação que nenhum
+humano deu, e o portão acreditava nela. Por isso `run()`, antes de montar prompt
+ou tocar o roteador:
+  1. relê a fila do disco e localiza o registro por `target.id` (ausente ou
+     duplicado → recusa);
+  2. exige que o status PERSISTIDO seja `accepted`;
+  3. exige que os campos que definem o que será lido — `url`, `kind`, `note`,
+     `focus`, `local_path` (e o próprio `status`) — sejam iguais aos do objeto
+     recebido; divergência → recusa, nomeando os campos e nunca os valores;
+  4. executa com o registro persistido, não com o objeto recebido.
+A aprovação também passou a cobrir mudanças posteriores da fonte: trocar o
+`local_path` de um alvo aprovado (`set_local_path`, ou `add` preenchendo o campo)
+devolve o alvo a `pending`. Se o registro aprovado tem `local_path` e esse caminho
+não existe (ou não é diretório) na hora de rodar, `run()` recusa antes do roteador
+em vez de cair em silêncio para a busca da URL. E, no fim de uma execução longa, o
+registro é conferido de novo ANTES de a ficha ser escrita: alvo rejeitado ou
+alterado durante a execução não ganha ficha nem vira `done`.
+
+O LIMITE, dito com precisão:
+  - O portão recusa, em relação à fila persistida, objetos forjados, obsoletos ou
+    divergentes, e fontes trocadas depois da aprovação.
+  - Ele NÃO distingue um `fpch canib accept` humano de código que chama a API da
+    fila (`set_status(id, "accepted")`, `_save`), reatribui `QUEUE_PATH` ou grava
+    `~/.fpch/cannibalize.json` — no mesmo processo ou fora dele. Para o portão,
+    tudo isso é aprovação.
+  - Aprovação fora de banda de verdade exigiria algo fora do processo (por
+    exemplo, uma confirmação que o agente não consegue produzir). NÃO está
+    implementado.
+  - A aprovação fixa a STRING de `local_path`, não o conteúdo do diretório:
+    arquivos trocados dentro do mesmo caminho depois da aprovação passam.
+  - Não há trava de arquivo: entre a última leitura da fila e a gravação de
+    `done` resta uma janela curta (escrita da ficha + gravação da fila) em que uma
+    mudança concorrente não é vista e pode ser sobrescrita — a mesma propriedade
+    de todo leitor-modificador-gravador deste módulo.
 """
 
 from __future__ import annotations
@@ -52,6 +91,7 @@ import re
 import time
 import uuid
 from dataclasses import asdict, dataclass, field
+from dataclasses import fields as _dataclass_fields
 from pathlib import Path
 
 from . import citations, router
@@ -69,23 +109,151 @@ FOCUS_CONCEPT = "conceito"
 FOCUS_FUNCTION = "funcao"
 
 
+_ID_FORMAT = re.compile(r"[0-9a-f]{8}")
+_ID_PLACEHOLDER = "<id>"
+_MAX_SHOWN = 40
+
+
+def _safe_text(value: object, limit: int = _MAX_SHOWN) -> str:
+    """Versão imprimível de um valor que pode ter vindo de objeto forjado ou da fila.
+
+    Todo caractere fora do ASCII imprimível (controle, ESC, quebra de linha,
+    não-ASCII) e a própria barra invertida viram `\\uXXXX`; o resultado é cortado
+    em `limit` caracteres. Impede que um id ou status fabricado injete sequência
+    ANSI ou linha falsa em terminal e log.
+    """
+    text = value if isinstance(value, str) else repr(value)
+    escaped = "".join(
+        ch if " " <= ch <= "~" and ch != "\\" else f"\\u{ord(ch):04x}" for ch in text
+    )
+    return escaped if len(escaped) <= limit else escaped[:limit] + "..."
+
+
+def _shown_id(target_id: object) -> tuple[str, str]:
+    """(id para exibir, id para o comando sugerido).
+
+    Id no formato que o módulo gera (`[0-9a-f]{8}`) aparece como está. Fora do
+    formato, a exibição é escapada e cortada, e o comando sugerido usa um marcador
+    genérico — não se sugere ao humano um comando montado com texto forjado.
+    """
+    if isinstance(target_id, str) and _ID_FORMAT.fullmatch(target_id):
+        return target_id, target_id
+    return f"'{_safe_text(target_id)}' (fora do formato de id)", _ID_PLACEHOLDER
+
+
 class TargetNotApprovedError(RuntimeError):
-    """Alvo chegou a `run()` sem aprovação humana.
+    """Alvo chegou a `run()` sem aprovação registrada na fila persistida.
+
+    O que "aprovação" significa aqui é o status `accepted` no registro da fila —
+    o portão não distingue um `fpch canib accept` humano de código que chama a API
+    da fila ou grava o arquivo (ver «O LIMITE» no docstring do módulo).
 
     Herda de `RuntimeError` de propósito: a CLI já captura `RuntimeError` no
     caminho de `canib run` (`cli.py`), então o portão da fronteira degrada para
     uma mensagem de erro legível em vez de um traceback, sem que a CLI precise
     mudar. Quem quiser distinguir o caso captura a classe específica.
+
+    `target_id` e `status` ficam crus nos atributos; na MENSAGEM são escapados.
     """
 
     def __init__(self, target_id: str, status: str) -> None:
         self.target_id = target_id
         self.status = status
+        shown, hint = _shown_id(target_id)
         super().__init__(
-            f"alvo {target_id} está '{status}', não '{STATUS_ACCEPTED}': "
-            f"a canibalização exige aprovação humana explícita.\n"
-            f"aprove com:  fpch canib accept {target_id}"
+            f"alvo {shown} está '{_safe_text(status)}', não '{STATUS_ACCEPTED}': "
+            f"a canibalização exige aprovação explícita registrada na fila.\n"
+            f"aprove com:  fpch canib accept {hint}"
         )
+
+
+class TargetApprovalMismatchError(TargetNotApprovedError):
+    """O alvo passado a `run()` não corresponde a uma aprovação persistida.
+
+    Cobre dois casos: o registro não existe na fila (objeto forjado, id inventado,
+    fila apagada) ou existe mas diverge do objeto recebido em algum campo que
+    define o que será lido. Subclasse de `TargetNotApprovedError` porque, para
+    quem só quer saber "posso rodar?", a resposta é a mesma: não.
+
+    A mensagem nomeia os CAMPOS divergentes e nunca os valores — valores de `url`
+    e `note` são conteúdo escolhido por quem montou o objeto e não têm por que
+    ecoar em log ou terminal. O id, que no caso de registro ausente também vem do
+    objeto forjado, é escapado (ver `_shown_id`).
+
+    Recusar objeto forjado ou divergente não é detectar aprovação humana: um
+    registro gravado como `accepted` por código passa (ver «O LIMITE»).
+    """
+
+    def __init__(
+        self,
+        target_id: str,
+        *,
+        fields: tuple[str, ...] = (),
+        status: str | None = None,
+        missing: bool = False,
+        reason: str = "",
+    ) -> None:
+        self.target_id = target_id
+        self.status = status
+        self.fields = tuple(fields)
+        self.missing = missing
+        partes: list[str] = [reason] if reason else []
+        if missing:
+            partes.append("não há registro deste id na fila de canibalização")
+        elif self.fields:
+            partes.append(
+                "divergência entre o alvo e o registro aprovado na fila nos campos: "
+                + ", ".join(self.fields)
+            )
+        if not partes:
+            partes.append("o registro persistido não confirma a aprovação")
+        detalhe = "; ".join(partes)
+        shown, hint = _shown_id(target_id)
+        RuntimeError.__init__(
+            self,
+            f"alvo {shown}: {detalhe}.\n"
+            f"a aprovação vale para o registro persistido na fila, não para cópias "
+            f"em memória. rode a partir da fila (fpch canib run {hint}); se a "
+            f"mudança é intencional, grave-a na fila e aprove de novo com:  "
+            f"fpch canib accept {hint}",
+        )
+
+
+class ApprovedSourceMissingError(RuntimeError):
+    """A fonte local aprovada (`local_path` do registro) não está disponível.
+
+    Falha FECHADO: a aprovação foi dada para ler do disco, e cair em silêncio para
+    a busca da URL trocaria a fonte aprovada por outra — justamente o
+    transbordamento de proveniência que o `local_path` existe para impedir. A
+    aprovação fixa a STRING do caminho, não o conteúdo do diretório.
+    """
+
+    def __init__(self, target_id: str, local_path: str) -> None:
+        self.target_id = target_id
+        self.local_path = local_path
+        shown, hint = _shown_id(target_id)
+        super().__init__(
+            f"alvo {shown}: a fonte local aprovada não existe ou não é um diretório "
+            f"(local_path = '{_safe_text(local_path, 200)}'). nada foi enviado ao "
+            f"roteador e a URL não será buscada no lugar dela.\n"
+            f"restaure o diretório, ou grave outro local_path (o alvo volta a "
+            f"pending) e aprove de novo com:  fpch canib accept {hint}"
+        )
+
+
+class QueueFormatError(RuntimeError):
+    """A fila persistida não tem o formato esperado.
+
+    Existe para que `run()` falhe FECHADO e com mensagem legível: um `TypeError`
+    cru vindo de `Target(**t)` não diz ao humano o que está errado, e um erro de
+    formato engolido por alguém a montante poderia ser confundido com "fila
+    vazia". Nada roda sobre uma fila que não se consegue ler com certeza.
+    """
+
+
+# Campos que definem O QUE a canibalização lê e com que instrução. Mudar qualquer
+# um deles depois da aprovação é mudar o objeto aprovado.
+APPROVAL_FIELDS: tuple[str, ...] = ("url", "kind", "note", "focus", "local_path")
 
 
 @dataclass
@@ -118,11 +286,50 @@ class Target:
     added_at: str = field(default_factory=lambda: time.strftime("%Y-%m-%d"))
 
 
+_TARGET_FIELDS = {f.name for f in _dataclass_fields(Target)}
+_REQUIRED_KEYS = ("url", "kind", "id")
+_OPTIONAL_STR_KEYS = ("local_path", "fiche_path")
+
+
 def _load() -> list[Target]:
+    """Lê a fila; levanta `QueueFormatError` se o formato não for o esperado.
+
+    Validação mínima, só o bastante para não construir `Target` sobre dado que
+    não se entende: topo lista, itens objeto, chaves conhecidas, obrigatórias
+    presentes, tipos corretos. Não é um esquema — é a recusa de adivinhar.
+    """
     if not QUEUE_PATH.exists():
         return []
-    raw = json.loads(QUEUE_PATH.read_text(encoding="utf-8"))
-    return [Target(**t) for t in raw]
+    try:
+        raw = json.loads(QUEUE_PATH.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise QueueFormatError(
+            f"fila ilegível em {QUEUE_PATH}: {type(exc).__name__}"
+        ) from exc
+    if not isinstance(raw, list):
+        raise QueueFormatError(
+            f"fila malformada em {QUEUE_PATH}: o topo deve ser uma lista, "
+            f"veio {type(raw).__name__}"
+        )
+    targets: list[Target] = []
+    for i, item in enumerate(raw):
+        where = f"fila malformada em {QUEUE_PATH}, item {i}"
+        if not isinstance(item, dict):
+            raise QueueFormatError(f"{where}: esperado objeto, veio {type(item).__name__}")
+        unknown = sorted(set(item) - _TARGET_FIELDS)
+        if unknown:
+            raise QueueFormatError(f"{where}: chaves desconhecidas: {', '.join(unknown)}")
+        missing = [k for k in _REQUIRED_KEYS if k not in item]
+        if missing:
+            raise QueueFormatError(f"{where}: chaves obrigatórias ausentes: {', '.join(missing)}")
+        for key, value in item.items():
+            ok = isinstance(value, str) or (key in _OPTIONAL_STR_KEYS and value is None)
+            if not ok:
+                raise QueueFormatError(
+                    f"{where}: campo '{key}' com tipo inválido ({type(value).__name__})"
+                )
+        targets.append(Target(**item))
+    return targets
 
 
 def _save(targets: list[Target]) -> None:
@@ -149,11 +356,18 @@ def add(
     focus: str = FOCUS_CONCEPT,
     local_path: str | None = None,
 ) -> Target:
+    """Enfileira um alvo, ou devolve o existente com mesma `url` e `focus`.
+
+    Se o existente não tinha `local_path` e este chamado fornece um, o campo é
+    preenchido — e, se o alvo estava aprovado, ele volta a `pending`: a fonte que
+    será lida mudou, e a aprovação anterior não a cobria. O chamador percebe pelo
+    `status` do alvo devolvido.
+    """
     targets = _load()
     for t in targets:
         if t.url == url and t.focus == focus:
             if local_path and not t.local_path:
-                t.local_path = local_path
+                _change_local_path(t, local_path)
                 _save(targets)
             return t
     target = Target(
@@ -164,11 +378,37 @@ def add(
     return target
 
 
+def _change_local_path(target: Target, local_path: str | None) -> bool:
+    """Troca `local_path` e revoga a aprovação se o valor mudou.
+
+    Devolve True se a aprovação foi revogada. Mesmo valor não revoga nada: não há
+    fonte nova a aprovar. Só `accepted` é rebaixado — `pending` e `rejected` já
+    não autorizam execução, e `done` não é executável sem nova aprovação.
+    """
+    if target.local_path == local_path:
+        return False
+    target.local_path = local_path
+    if target.status == STATUS_ACCEPTED:
+        target.status = STATUS_PENDING
+        return True
+    return False
+
+
+def reapproval_hint(target_id: str) -> str:
+    """Linha acionável para o humano quando a aprovação de um alvo foi revogada."""
+    return f"aprovação revogada: a fonte mudou. aprove de novo com:  fpch canib accept {target_id}"
+
+
 def set_local_path(target_id: str, local_path: str) -> Target | None:
+    """Grava `local_path`; se o alvo estava aprovado e o valor mudou, volta a `pending`.
+
+    O chamador distingue a revogação pelo `status` do alvo devolvido e pode
+    mostrar `reapproval_hint(id)` ao humano.
+    """
     targets = _load()
     for t in targets:
         if t.id == target_id:
-            t.local_path = local_path
+            _change_local_path(t, local_path)
             _save(targets)
             return t
     return None
@@ -363,6 +603,44 @@ One action, small enough to do in a single sitting.
 No preamble. Start at "## Veredito"."""
 
 
+def _verify_approval(targets: list[Target], target: Target) -> Target:
+    """Localiza em `targets` o registro de `target.id` e confere a aprovação.
+
+    Devolve o registro PERSISTIDO (o objeto da lista, não `target`). Levanta:
+      - `TargetApprovalMismatchError` se o id não existe ou aparece mais de uma
+        vez (ambíguo = não aprovado);
+      - `TargetNotApprovedError` se o status persistido não é `accepted`;
+      - `TargetApprovalMismatchError` se algum campo de `APPROVAL_FIELDS`, ou o
+        `status`, diverge entre `target` e o registro.
+    """
+    matches = [t for t in targets if t.id == target.id]
+    if not matches:
+        raise TargetApprovalMismatchError(target.id, missing=True)
+    if len(matches) > 1:
+        raise TargetApprovalMismatchError(
+            target.id, reason="o id aparece mais de uma vez na fila (registro ambíguo)"
+        )
+    persisted = matches[0]
+    if persisted.status != STATUS_ACCEPTED:
+        raise TargetNotApprovedError(persisted.id, persisted.status)
+    divergentes = tuple(
+        name
+        for name in (*APPROVAL_FIELDS, "status")
+        if getattr(target, name) != getattr(persisted, name)
+    )
+    if divergentes:
+        raise TargetApprovalMismatchError(
+            target.id, fields=divergentes, status=persisted.status
+        )
+    return persisted
+
+
+def _require_local_source(target: Target) -> None:
+    """Se o registro aprovado aponta para uma fonte local, ela tem de ser um diretório."""
+    if target.local_path and not Path(target.local_path).is_dir():
+        raise ApprovedSourceMissingError(target.id, target.local_path)
+
+
 def run(
     target: Target,
     *,
@@ -378,20 +656,38 @@ def run(
     (caro, precisa de modelo forte). Rotear os dois igual desperdiça cota ou
     entrega juízo raso.
 
-    Levanta `TargetNotApprovedError` se `target.status` não for
-    `STATUS_ACCEPTED`. A conferência é a PRIMEIRA coisa que acontece, antes de
-    qualquer montagem de prompt e muito antes de o roteador ser tocado: o alvo
-    não aprovado não deve custar nem uma invocação de backend. Não é `assert`
+    O portão é a PRIMEIRA coisa que acontece, antes de qualquer montagem de
+    prompt e muito antes de o roteador ser tocado: relê a fila do disco e exige
+    que o registro de `target.id` exista, esteja `accepted` e coincida com
+    `target` nos campos de `APPROVAL_FIELDS` (ver `_verify_approval`). O alvo
+    não aprovado não custa nem uma invocação de backend. Daí em diante a
+    execução usa o registro PERSISTIDO, nunca o objeto recebido. Não é `assert`
     porque `assert` some com `python -O` — invariante de segurança que evapora
     sob otimização não é invariante.
+
+    Levanta `TargetNotApprovedError` (status persistido não aprovado),
+    `TargetApprovalMismatchError` (registro ausente, ambíguo ou divergente —
+    inclusive se mudou DURANTE a execução), `ApprovedSourceMissingError` (o
+    registro tem `local_path` e o diretório não existe — nunca há recuo silencioso
+    para a URL) e `QueueFormatError` (fila ilegível).
+
+    Revogação durante a execução: a aprovação é conferida de novo depois das
+    duas chamadas ao roteador e ANTES de a ficha ser escrita. Se o alvo foi
+    rejeitado ou alterado no meio, nenhuma ficha é escrita e o alvo não vira
+    `done`. Escolha deliberada: escrever a ficha e depois apagá-la deixaria um
+    artefato órfão se o processo morresse entre as duas operações. O que já foi
+    enviado aos backends não tem como ser desenviado — a revogação tardia impede
+    o registro do resultado, não o custo nem a exposição do prompt.
     """
-    if target.status != STATUS_ACCEPTED:
-        raise TargetNotApprovedError(target.id, target.status)
+    # O nome `target` passa a apontar para o REGISTRO PERSISTIDO: daqui em diante
+    # o objeto recebido do chamador não é lido para mais nada.
+    target = _verify_approval(_load(), target)
+    _require_local_source(target)
 
     note_block = f"\nContexto dado pelo autor: {target.note}\n" if target.note else ""
 
     extra_dirs: list[Path] = []
-    if target.local_path and Path(target.local_path).exists():
+    if target.local_path:
         local = Path(target.local_path)
         extra_dirs.append(local)
         source_block = (
@@ -446,21 +742,44 @@ def run(
     # existir. Roda sempre, inclusive quando passa — validador que só aparece na
     # falha não é auditável.
     cite_report = None
-    if target.local_path and Path(target.local_path).exists():
+    if target.local_path:
+        # A fonte pode ter sumido durante a execução; sem ela não há validação
+        # de citações, e ficha sem validação de um alvo local não é gravada.
+        _require_local_source(target)
         cite_report = citations.validate(extraction.text, Path(target.local_path))
+
+    content = _render(target, extraction, proposal, cite_report)
+
+    # Reconferência (TOCTOU): a execução pode levar minutos, e nesse intervalo o
+    # humano pode ter rejeitado o alvo ou alguém pode ter trocado a fonte. Relê a
+    # fila e confere contra o registro aprovado no início, ANTES de escrever a
+    # ficha. Uma única leitura sustenta a conferência e a marcação de `done`.
+    targets = _load()
+    try:
+        current = _verify_approval(targets, target)
+    except TargetNotApprovedError as exc:
+        raise TargetApprovalMismatchError(
+            target.id,
+            fields=getattr(exc, "fields", ()),
+            status=exc.status,
+            missing=getattr(exc, "missing", False),
+            reason=(
+                "a aprovação mudou durante a execução"
+                + (
+                    f" (status persistido agora: '{_safe_text(exc.status)}')"
+                    if exc.status
+                    else ""
+                )
+                + "; nenhuma ficha foi escrita e o alvo não foi marcado como concluído"
+            ),
+        ) from exc
 
     fiche_dir.mkdir(parents=True, exist_ok=True)
     path = fiche_dir / f"CANIB-{target.focus}-{_slug(target.url)}.md"
-    path.write_text(
-        _render(target, extraction, proposal, cite_report),
-        encoding="utf-8",
-    )
+    path.write_text(content, encoding="utf-8")
 
-    set_status(target.id, STATUS_DONE)
-    targets = _load()
-    for t in targets:
-        if t.id == target.id:
-            t.fiche_path = str(path)
+    current.status = STATUS_DONE
+    current.fiche_path = str(path)
     _save(targets)
     return path
 

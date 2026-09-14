@@ -996,6 +996,17 @@ def _cmd_audit_process(trilha: Path | None) -> int:
 
 
 def _cmd_canib(args: argparse.Namespace) -> int:
+    # Fila malformada falha fechado em qualquer subcomando — inclusive na leitura
+    # que `run`/`runall` fazem ANTES de chegar ao `try` de `cannibalize.run()`.
+    # Mensagem legível e código 1, em vez de traceback.
+    try:
+        return _cmd_canib_dispatch(args)
+    except cannibalize.QueueFormatError as exc:
+        print(f"erro: {exc}", file=sys.stderr)
+        return 1
+
+
+def _cmd_canib_dispatch(args: argparse.Namespace) -> int:
     if args.canib_cmd == "add":
         t = cannibalize.add(args.url, args.note or "", args.focus)
         print(f"{t.id}  [{t.status}]  {t.focus:<9} {t.kind:<6} {t.url}")
