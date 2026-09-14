@@ -230,3 +230,81 @@ O endurecimento reaproveita e estende o de C16: um leitor defensivo agora compar
 | Entregáveis acadêmicos | congelados e sem alteração nesta fatia |
 
 Em aberto, e não decidido por este apêndice: desenho de *allowlist*, desenho de catálogo (C15) e se uma verificação bem-sucedida deve virar precondição de um futuro `setup apply`. Candidato ao próximo corte de C7, não compromisso: varredura determinística de metadados/manifesto MCP em busca de Unicode oculto, incluindo blocos TAG (arXiv:2607.05744) e caracteres *bidi*/de largura zero.
+
+## 20. Apêndice de desenvolvimento: C7, 3º corte — varredura de Unicode oculto em metadados MCP
+
+Ainda em 13/09/2026, terceiro corte do dia, o autor aprovou implementar os dois candidatos deixados em aberto pelo §19: a varredura de Unicode oculto (a) e o portão de evidência MCP verificada em `setup apply` (b, ver §22). C7 permanece **parcial**.
+
+`fpch mcp scan <arquivo> [--json] [--format auto|json|text]` varre metadados MCP (o retorno de `tools/list` ou um manifesto) em busca de Unicode oculto, com a ameaça descrita em arXiv:2607.05744 como referência. Saída 0 = limpo; 1 = achado, com o resultado ainda impresso; 2 = erro. A API em `src/fpch/mcp.py` ganhou `scan_metadata`, `scan_bytes`, `classify_code_point`, `dumps_scan` e `read_metadata_json`, além dos tipos `FpchMcpMetadataScan` e `FpchMcpUnicodeFinding` (este com os campos `escaped` e `pointer_truncated`). O *ruleset* aplicado é `fpch-hidden-unicode-1`.
+
+**Classes sinalizadas, todas fail-closed:** `tag`, `bidi`, `zero_width`, `variation_selector`, `control`, `line_separator`, `invisible_filler` (incluindo U+2800), `noncharacter`, `surrogate`, `private_use`, `other_format` (categoria Unicode Cf) e `unassigned` (Cn). **Não há exceção para emoji**: bandeiras de emoji usam caracteres TAG, e ZWJ/VS16 também são sinalizados — a varredura não distingue uso decorativo de uso adversário do mesmo ponto de código.
+
+Um BOM (*byte order mark*) na posição inicial do arquivo é permitido e registrado como `leading_bom`, em vez de contar como achado.
+
+O **modo JSON** varre chaves e strings decodificadas do documento; chaves duplicadas, `NaN` e profundidade acima de 256 são rejeitados antes mesmo de a varredura de Unicode começar. O **modo texto** também detecta escapes `\uXXXX` e `\u{...}`, marcados como "escapado" no achado — mas essa detecção **ignora contexto de citação**, o que é uma fonte conhecida de falso positivo (ver §24).
+
+Os apontadores (*pointers*) de cada achado são sanitizados por segurança: qualquer caractere sinalizado dentro do apontador vira U+FFFD, e o apontador inteiro é limitado a 1.024 caracteres — o que significa que um apontador truncado **pode não resolver** sob RFC 6901. Os achados detalhados são limitados a 100; os totais por classe permanecem exatos mesmo quando os achados individuais são cortados. `unicode_version` é registrado no resultado, para que uma futura atualização do Python com tabela Unicode diferente seja rastreável.
+
+O limite de entrada é 1 MiB, usando o mesmo leitor defensivo compartilhado com `load` e `verify_artifact`. **Membros de arquivo compactado (zip/tar) não são varridos** — decisão deliberada: um cliente MCP real só vê o retorno de `tools/list` em tempo de execução, nunca o arquivo compactado de distribuição, e decodificar arquivos compactados em memória traz risco de *bomb* (expansão descontrolada) e risco de diferença de *parser* (o que o `fpch scan` decodifica pode não ser bit a bit o que o cliente MCP real decodifica).
+
+## 21. Verificação executada após a varredura de Unicode oculto
+
+*Smoke test* manual em diretório temporário: um arquivo `.txt` de metadados contendo um caractere TAG (U+E0041) escapado como `\u{e0041}` produziu `fpch mcp scan` com saída 1 e achado de classe `tag (escapado)`. Um arquivo de metadados limpo produziu saída 0. O comportamento está descrito em conjunto com o portão de `setup apply` no quadro do §23, porque as duas peças foram verificadas ponta a ponta no mesmo *smoke test*.
+
+## 22. Apêndice de desenvolvimento: C4/C7 — portão de evidência MCP verificada em `setup apply`
+
+O segundo candidato aprovado pelo autor conecta a verificação de C7 à aplicação de C4: `fpch setup apply plano.json --confirm <id> --mcp-artifact NOME=CAMINHO --mcp-metadata NOME=CAMINHO`. Ambas as opções são repetíveis e, juntas, precisam cobrir **cada checkpoint do plano exatamente uma vez**; um nome desconhecido ou duplicado devolve saída 2 antes de qualquer tentativa de mutação.
+
+Na API, `apply(..., mcp_evidence={name: FpchMcpApplyEvidence(artifact, metadata)})` recebe a evidência por checkpoint, e o resultado (`FpchSetupResult.mcp_verified`) lista os nomes efetivamente verificados. Para cada checkpoint do plano, a aplicação exige duas condições: `verify_artifact` retornando verificado, **e** uma varredura limpa dos metadados — a varredura de metadados é **obrigatória**, **sempre em modo JSON independentemente da extensão do arquivo**, e o documento não pode estar vazio (objeto ou array de nível superior não vazio).
+
+Essa checagem dupla é executada **antes** de adquirir o *lock* de aplicação e **reconferida dentro do lock, antes da auditoria** — inclusive no ramo em que a aplicação não teria nada a fazer (*no-op*). Uma diferença entre a checagem externa e a interna aciona rollback: o teorema é que nada é auditado como instalação com uma evidência que pode ter mudado entre a leitura e o commit.
+
+Os caminhos de artefato e de metadados são recusados quando apontam para dentro de `.fpch` — tanto por comparação léxica do caminho quanto por `realpath` (com tratamento dos prefixos de caminho do Windows), fechando a via óbvia de um checkpoint apontar evidência para dentro da própria área de controle do FPCH.
+
+Quando a verificação é bem-sucedida, a aplicação grava `.fpch/mcp-verification.json` — esquema 1, JSON canônico, `installed: false`, sem caminhos absolutos — por criação exclusiva (nunca sobrescreve), e o manifesto de setup passa a ser **versão 2**, com um bloco `"mcp": {checkpoints, evidence_path, installed: false}`. O rótulo de auditoria correspondente é `"fpch setup apply (MCP verificado, não instalado)"`; **verificações que falham não são auditadas** — só o sucesso produz evento.
+
+Planos sem nenhum checkpoint continuam **byte-idênticos** ao comportamento anterior: manifesto versão 1, mesmo `plan_id`, mesmas mensagens — o portão só se ativa quando há checkpoint MCP no plano.
+
+**Assimetria registrada como ponto [AUTOR]:** `fpch setup plan` com checkpoints continua retornando saída 1 (`is_applicable` falso) mesmo depois deste corte — o plano em si nunca ficou "aplicável" na presença de checkpoint, e este corte não mudou isso, só deu a `apply` uma via de evidência para prosseguir apesar disso. Se essa saída de `plan` deveria mudar para refletir que agora existe um caminho de aplicação é decisão do autor, não deste apêndice.
+
+Continua valendo o limite de fundo: **nada é instalado ou executado.** Não há *download*, rede, resolução de pacote, escrita de configuração de cliente (`.mcp.json`), *allowlist*, catálogo C15 nem executor de desfazimento C25.
+
+### Escolhas de engenharia tomadas como *default*, para revisão do autor
+
+- Metadados obrigatórios (não há caminho de aplicação sem varredura de metadados).
+- BOM inicial permitido (não conta como achado de Unicode oculto).
+- Limite de metadados em 1 MiB (mesmo teto do checkpoint).
+- Verificações que falham não geram evento de auditoria.
+- Caminhos de artefato e de metadados ficam fora de `plan_id` (não são parte do conteúdo congelado do plano).
+- `fpch setup plan` com checkpoint continua retornando saída 1, mesmo com o portão de evidência agora existindo.
+
+## 23. Verificação executada após o portão de `setup apply`
+
+O plano foi desenhado por um agente Plan em modelo *opus* e a implementação foi dividida em três pacotes de trabalho paralelos: WP-A (varredura), WP-B (portão de `apply`) e WP-C (CLI). Uma revisão independente somente leitura encontrou **1 problema bloqueador e 8 riscos**, todos corrigidos. O bloqueador: o comando `setup` usava `format=auto` na varredura de metadados, de modo que um arquivo `.txt` contendo um TAG escapado passava como limpo apenas por causa da extensão — corrigido ao fixar o modo JSON independentemente do sufixo do arquivo (ver §22). Testes de mutação confirmaram que os testes novos detectam os defeitos corrigidos.
+
+*Smoke test* manual ponta a ponta em um repositório temporário:
+
+| Cenário | Resultado |
+|---|---|
+| Metadados `.txt` com TAG U+E0041 escapado | `mcp scan` → saída 1, "tag (escapado)"; `apply` recusado, repositório intocado |
+| Metadados limpos | `apply` → saída 0, gravando `AGENTS.md`, `CLAUDE.md`, `.fpch/setup-manifest.json` e `.fpch/mcp-verification.json` com `installed=false`, `verified=true`, `format=json` |
+
+| Verificação | Resultado em 13/09/2026 |
+|---|---|
+| Suíte completa | **765 passed, 12 skipped em 13,07 s** (era 518 passed, 10 skipped) |
+| Código do protótipo | **16 módulos, 10.759 linhas físicas em `src/fpch/`** |
+| Testes | **19 arquivos, 9.578 linhas físicas** |
+| Grafo graphify | **não recalculado nesta sessão** — seguem valendo os 5.478 nós/6.790 arestas/497 comunidades do corte de C16 |
+| Efeitos de rede/instalação | nenhum — sem *download*, resolução, execução, extração ou instalação |
+| Aplicação | segue exigindo evidência verificada por checkpoint; nada é instalado |
+| Entregáveis acadêmicos | congelados e sem alteração nesta fatia |
+
+## 24. Limites residuais do corte, e o que continua em aberto
+
+- **(a)** A evidência de C16/C7 registra `unicode_version` e `ruleset`; uma atualização futura do Python (tabela Unicode nova) faz um `setup apply` repetido falhar como "divergente" mesmo sem nenhuma mudança real de conteúdo.
+- **(b)** Quando um arquivo de evidência já existente é adotado como inalterado, qualquer `plan_id` bem formado é aceito — a proveniência desse campo, isto é, se ele realmente veio de um `setup plan` anterior e não foi editado à mão, não é comprovada.
+- **(c)** Os metadados não têm vínculo criptográfico com o artefato: qualquer JSON limpo e não vazio conta como evidência válida, mesmo que não descreva de fato aquele artefato.
+- A detecção de escapes em modo texto ignora contexto de citação, o que pode gerar falso positivo (por exemplo, um `\uXXXX` dentro de um comentário sobre o próprio caractere, e não o caractere em si).
+- Seguem valendo os limites já registrados em C16/C7 2º corte (§18): reescrita *in-place* que preserva `mtime`; *hardlinks*; ausência de `O_NOFOLLOW` no Windows; testes reais de *symlink* seguem pulados nesta máquina (`WinError 1314`).
+
+**Candidatos ao próximo passo, não decisão:** revisão do autor sobre os seis pontos [AUTOR] listados no §22; vincular metadados ao artefato por *digest*, por exemplo dentro do próprio checkpoint, o que muda o esquema do checkpoint; instalação de fato continua bloqueada até decisão sobre *allowlist*/C15/C25. C4 e C7 continuam parciais; C15, C17, C23 e C25 continuam abertos.
