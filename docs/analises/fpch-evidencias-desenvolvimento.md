@@ -397,3 +397,75 @@ Na suíte, `test_run_usa_o_registro_persistido` foi reescrito para mutar o objet
 - Uma fila gravada por uma versão futura do FPCH, com chaves adicionais em `Target`, falha fechada como `QueueFormatError` em vez de ignorar os campos desconhecidos — decisão deliberada de não adivinhar formato, com o custo de exigir migração explícita se o esquema de `Target` crescer.
 
 **Candidatos ao próximo passo, não decisão:** **C18** (substituir `_FAILURE_SIGNATURES` — lista literal de mensagens de erro de terceiro em `backends.py:81-90` — por validação mais robusta) e **C19** (capturar mais que `BackendUnavailable` no laço de escalada de `router.py:85-99`) são dívidas de engenharia identificadas no mesmo levantamento, sem decisão pendente do autor — ambas descritas no `TODO.md`. C4 e C7 continuam parciais; C15, C23 e C25 continuam abertos.
+
+## 33. Apêndice de desenvolvimento: C18 — contrato de saída por sentinela, no lugar da `_FAILURE_SIGNATURES` como defesa principal
+
+**Problema de partida.** `backends.invoke` tratava `exit 0` como sucesso a menos que a saída contivesse uma de 8 frases literais de erro de fornecedor (`_FAILURE_SIGNATURES`, `backends.py:81-90`) ou tivesse menos de 40 caracteres. Se um fornecedor mudasse o texto do erro, a falha semântica passava em silêncio — é a mesma classe de risco do incidente de 16/07/2026 (mensagem de erro do `agy` analisada como artefato de conteúdo, 6 fichas alucinadas) e do C11 (catálogo `agy` extraído empiricamente, que quebraria calado se a Google renomeasse um modelo).
+
+**Desenho do contrato: positivo, e independente do texto do fornecedor.** `FpchContratoSaida.novo()` gera um nonce por chamada com `secrets.token_hex(8)`. A instrução acrescentada ao prompt pede que a resposta termine com a linha `FPCH-FIM-<nonce>`, mas o texto da instrução **descreve a sentinela em partes** ("a palavra FPCH-FIM, um hífen, e este código: ...") — nunca contém a cadeia completa `FPCH-FIM-<nonce>` de uma vez, para que um eco literal do prompt na resposta do modelo não bata como sentinela cumprida por acaso.
+
+**Regra de validação: a última linha não vazia, e só ela.** A sentinela precisa ser a última linha não vazia da resposta, tolerando CRLF, espaço em branco e decoração markdown (`_DECORACAO`) em volta. A alternativa mais simples — aceitar a sentinela em qualquer ocorrência, não só na última linha — foi **rejeitada deliberadamente**: aceitaria também texto colado depois da sentinela, que é exatamente a forma de uma mensagem de erro de fornecedor anexada ao fim de uma resposta por lo contrário boa. Só o token desta chamada específica é removido de `Result.text`, como token inteiro delimitado por fronteira de palavra (`(?<![0-9A-Za-z])...(?![0-9A-Za-z])`) — sentinelas de *outras* chamadas, ou literais que já existem neste próprio repositório (por exemplo, exemplos em testes), não são tocados, então uma ficha de canibalização escrita sobre este repo não fica corrompida por remoção indevida.
+
+**Ordem de decisão de falha: `exit≠0` → contrato → *denylist*.** Uma falha de contrato produz o prefixo estável `FPCH_ERRO_SENTINELA_AUSENTE = "contrato de saída não cumprido: sentinela ausente"`, seguido da assinatura da *denylist* quando uma delas bate no texto (mesmo sem sentinela) e de um trecho saneado de até 200 caracteres da resposta. A `_FAILURE_SIGNATURES` deixou de ser a linha principal de defesa e passou a diagnóstico e defesa em profundidade — ela ainda roda mesmo quando o contrato passa, contra o caso em que o modelo cumpriu a forma da sentinela mas a resposta é, ainda assim, uma mensagem de erro. A checagem por tamanho ("< 40 caracteres") permanece como heurística declarada, não como regra formal.
+
+**Registro e compatibilidade da trilha.** `Result.contract` grava `"sentinela"` ou `"nenhum"` (`FPCH_CONTRATO_SENTINELA`/`FPCH_CONTRATO_NENHUM`), e `Result.failure_signature` grava a assinatura da *denylist* quando aplicável. Os mesmos campos passaram a existir, como opcionais, em eventos `attempt` — inclusive tentativas contra um backend indisponível, onde nenhum texto chegou a ser produzido. Não houve *bump* de esquema de auditoria: campos vazios não são escritos, então eventos anteriores a C18 continuam lendo normalmente. Um evento pré-C18 foi congelado com hash literal num teste de regressão para fixar a compatibilidade retroativa da cadeia; `fpch audit` (saída 0) foi conferido lendo a trilha real depois da mudança.
+
+**Opt-out declarado, não usado.** `invoke`/`route` ganharam o parâmetro `output_contract: bool = True`; passar `False` desliga o contrato deliberadamente e fica registrado como `Result.contract == "nenhum"`. Nenhum chamador do próprio FPCH usa o opt-out — ele existe para quem precisar de uma chamada crua, não como caminho recomendado.
+
+**Efeito no *staging* de prompts.** `_ARG_LIMIT` (24.000 caracteres) e a lógica de *staging* por arquivo temporário passaram a contar o tamanho da instrução do contrato via `FPCH_CONTRATO_INSTRUCAO_CHARS` (medido a partir de uma instância de referência com nonce fixo de 16 zeros). `prompt_chars`, o campo gravado na trilha, continua sendo só o tamanho do prompt do chamador — a instrução do contrato não entra nele — para que a série histórica de tamanhos de prompt permaneça comparável antes e depois de C18.
+
+**Copilot: `-s/--silent` obrigatório.** O adaptador do Copilot passou a sempre incluir `-s`/`--silent` na chamada, confirmado presente no `--help` do CLI. Sem essa flag, o Copilot imprime estatísticas depois da resposta, o que faria a sentinela deixar de ser a última linha não vazia e reprovaria toda chamada pela regra da última linha — um falso-negativo sistemático que o contrato existe justamente para evitar em outra direção.
+
+**Envelope estruturado (JSON): investigado e declarado ausente.** Os três CLIs — `claude` 2.1.270, `copilot` 1.0.83 e `agy` 1.2.2 — aceitam `--output-format json` no próprio `--help`, mas **nenhum documenta o esquema** da saída JSON. Cada adaptador declara `Regime.saida_estruturada = AUSENTE`, com a evidência (a linha do `--help`) anexada ao código. Não há *parser* de envelope neste corte: sem esquema verificado, um *parser* seria só mais uma lista de padrões frágil, a mesma classe de risco que C18 está corrigindo em outro lugar.
+
+**Controle de custo.** Nenhum modelo foi invocado durante o desenvolvimento de C18 — só `--help`/`--version` dos três CLIs, para confirmar as flags e a ausência de esquema JSON documentado. Isso significa que a taxa de cumprimento real da instrução da sentinela por modelo **não foi medida** neste corte (ver §35).
+
+## 34. Verificação executada após C18
+
+| Verificação | Resultado em 14/09/2026 |
+|---|---|
+| Suíte completa | **865 passed, 12 skipped em 14,01 s** (era 808 passed, 12 skipped) |
+| Código do protótipo | **16 módulos, 11.378 linhas físicas em `src/fpch/`** |
+| Testes | **20 arquivos, 10.797 linhas físicas em `tests/`** (reconferido por glob + contagem de linhas, não só por relato) |
+| Revisão independente (primeira rodada) | 0 bloqueadores, 5 riscos e 3 *nits* |
+| Revisão independente (segunda rodada) | todos os 5 riscos e os 3 *nits* corrigidos |
+| Testes de mutação | as checagens removidas foram capturadas pelos testes novos |
+| Evidência de CLI | `--help` de `claude` 2.1.270, `copilot` 1.0.83 e `agy` 1.2.2 conferido — `--output-format json` presente, esquema ausente nos três |
+| Chamadas reais a modelo | **zero** — só `--help`/`--version` |
+| Graphify | **não recalculado nesta sessão** — seguem valendo 5.478/6.790/497 do corte de C16 |
+| Commit | `6e0285a` — `feat(backends): require per-call output sentinel instead of error denylist (C18)` |
+| Entregáveis acadêmicos | congelados e sem alteração nesta fatia |
+
+## 35. O que a revisão independente corrigiu, e o mais importante dos cinco riscos
+
+A primeira rodada da revisão achou **0 bloqueadores, 5 riscos e 3 *nits***, todos corrigidos numa segunda rodada. **O mais importante:** na falha de contrato, a mensagem de erro havia perdido o diagnóstico que `_FAILURE_SIGNATURES` sozinha ainda dava — cota esgotada, falha de autenticação e recusa de ferramenta passaram a parecer todos iguais ("sentinela ausente"), quando antes cada um tinha uma assinatura reconhecível na *denylist*. É reincidência da classe de risco do C11: um mecanismo de segurança novo que, ao resolver um problema, apaga informação que outra parte do sistema (e o operador humano) precisava para diagnosticar a causa. A correção manteve a assinatura da *denylist*, quando existente, dentro da mensagem de falha de contrato, em vez de substituí-la.
+
+Os demais quatro achados, todos corrigidos:
+
+- **Regex da sentinela sem fronteiras** apagava conteúdo de ficha em vez de só o token da sentinela — corrigido com fronteira de palavra (`(?<![0-9A-Za-z])...(?![0-9A-Za-z])`) na remoção.
+- **Tentativa de backend indisponível sem `contract`** — um evento `attempt` para um backend que nunca respondeu ficava com a aparência de um evento pré-C18, indistinguível na trilha. Corrigido para gravar `contract="nenhum"` mesmo nesse caminho.
+- **Teste de retrocompatibilidade fraco** — não fixava o hash de um evento pré-C18 real; fortalecido com um evento congelado e hash literal.
+- **Fronteira de `_ARG_LIMIT` sem teste** — o efeito de `FPCH_CONTRATO_INSTRUCAO_CHARS` sobre o *staging* não tinha teste na fronteira exata; adicionado.
+- **Teste do roteador tautológico** — um teste que só reafirmava o próprio código em vez de exercitar o comportamento observável foi reescrito.
+
+## 36. Limites residuais do corte, e o que continua em aberto
+
+- **A sentinela prova que a chamada terminou, não que o conteúdo está correto.** É um contrato de forma, não de semântica — um modelo pode cumprir a sentinela e ainda assim responder algo inútil ou errado; isso não é o que C18 verifica.
+- **Modelos que ignoram a instrução produzem falso-falha**, e cada falso-falha custa uma escalada real de cota para o próximo backend na cadeia. **A taxa de cumprimento real por modelo não foi medida** neste corte, porque medi-la exige chamadas reais, que gastam cota — é justamente o motivo do *smoke test* real ser a decisão [AUTOR] mais importante em aberto (§37).
+- `agy -p` pode imprimir texto depois da resposta do modelo; não verificado neste corte se isso quebra a regra da última linha em algum caso real.
+- **Um modelo pode copiar o nonce** de volta se ele aparecer em qualquer parte do contexto que o modelo processa — isto não protege contra um modelo adversarial que tenta ativamente forjar conformidade; o contrato assume um modelo que tenta cooperar e às vezes falha, não um que tenta enganar o verificador.
+- `failure_signature` só é preenchido quando `exit 0` — falhas de processo (`exit≠0`) não passam pela *denylist*, porque a causa já é conhecida pelo código de saída.
+
+## 37. Decisões em aberto do autor, e a dívida achada (C26)
+
+**(1) *Smoke test* real — a mais importante.** Uma chamada real por backend (`agy`/`copilot`, fora da cota Claude) para medir o cumprimento da sentinela antes de confiar nela no dia a dia. É a mais importante das quatro porque **C18 muda o comportamento de toda chamada real** a partir de agora — se um modelo específico ignora a instrução com frequência, o contrato produz falso-falha sistemático contra esse modelo, e isso só aparece com dado real.
+
+**(2) Flag de CLI `ask --sem-contrato`**, espelhando o opt-out já existente em `invoke`/`route` na camada de programação, para uso manual pontual.
+
+**(3) Se `improve.REGRA_ASSINATURA` deve ler `failure_signature`** — o laço de autoaprimoramento ainda não foi ligado ao novo campo; decidir se vale a pena antes de qualquer proposta automática usar a assinatura da *denylist* como sinal.
+
+**(4) Um futuro *parser* de envelope JSON**, que precisa de capturas de saída real dos três CLIs em modo `--output-format json` para inferir o esquema não documentado — trabalho que também gasta cota e não foi feito neste corte.
+
+**Dívida achada, registrada como C26 no `TODO.md`, não decisão:** `policy.py` `ImmutableBlock.referencia` aponta `backends.py:128-129` e `cannibalize.py:208-247`, ambos defasados — o primeiro porque C18 reescreveu boa parte de `backends.py` ao redor dessas linhas, o segundo desde C17. São blocos de **política imutável**; corrigir a referência é edição mecânica, mas sobre um bloco marcado imutável, o que pede confirmação explícita antes de tocar.
+
+C4 e C7 continuam parciais; C15, C23 e C25 continuam abertos.
