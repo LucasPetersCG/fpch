@@ -307,4 +307,93 @@ O plano foi desenhado por um agente Plan em modelo *opus* e a implementação fo
 - A detecção de escapes em modo texto ignora contexto de citação, o que pode gerar falso positivo (por exemplo, um `\uXXXX` dentro de um comentário sobre o próprio caractere, e não o caractere em si).
 - Seguem valendo os limites já registrados em C16/C7 2º corte (§18): reescrita *in-place* que preserva `mtime`; *hardlinks*; ausência de `O_NOFOLLOW` no Windows; testes reais de *symlink* seguem pulados nesta máquina (`WinError 1314`).
 
-**Candidatos ao próximo passo, não decisão:** revisão do autor sobre os seis pontos [AUTOR] listados no §22; vincular metadados ao artefato por *digest*, por exemplo dentro do próprio checkpoint, o que muda o esquema do checkpoint; instalação de fato continua bloqueada até decisão sobre *allowlist*/C15/C25. C4 e C7 continuam parciais; C15, C17, C23 e C25 continuam abertos.
+**Candidatos ao próximo passo, não decisão:** revisão do autor sobre os seis pontos [AUTOR] listados no §22; vincular metadados ao artefato por *digest*, por exemplo dentro do próprio checkpoint, o que muda o esquema do checkpoint; instalação de fato continua bloqueada até decisão sobre *allowlist*/C15/C25. C4 e C7 continuam parciais; C15, C23 e C25 continuam abertos; **C17 foi concluída no corte seguinte, registrado a partir do §25.**
+
+## 25. Apêndice de desenvolvimento: C17 — gate de aprovação na fronteira do módulo de canibalização
+
+Ainda em 13/09/2026, quarto corte do dia, C17 foi concluída e, numa segunda rodada no mesmo corte, teve um *overclaim* de segurança no próprio docstring corrigido a partir de revisão independente — commitada como `eace234`. **Achado de abertura, antes de qualquer código novo:** o escopo original do item — checar `target.status` como primeira instrução de `cannibalize.run()`, para que quem chame a função diretamente não contorne a invariante de segurança que a CLI já impunha em `_cmd_canib` — já estava implementado desde o commit `f861281`, com 8 testes cobrindo o caso. O `TODO.md` nunca fora marcado `[x]`. A sessão conferiu o estado real do código antes de tratar o item como aberto, em vez de assumir a lacuna a partir apenas da redação do backlog.
+
+O que restava, e este corte fechou, eram **contornos internos que a checagem de `target.status` sozinha não cobria**: o portão conferia o objeto `Target` recebido em memória, não o registro persistido na fila. `Target(status="accepted")` construído à mão, ou `dataclasses.replace(t, status="accepted")` sobre uma cópia, fabricavam uma aprovação que nenhum humano deu, e o portão original acreditava nela — o mesmo anti-padrão, um nível abaixo, que a fatia funcional de 01/09/2026 já havia corrigido na fronteira entre CLI e módulo.
+
+## 26. O portão contra o registro persistido
+
+`run()` agora executa, antes de montar qualquer prompt ou tocar o roteador, uma nova função `_verify_approval(targets, target)` que:
+
+1. relê a fila do disco (`_load()`) e localiza o registro cujo `id` combina com `target.id`; ausência ou duplicidade de id é tratada como não aprovado (registro ambíguo não autoriza nada);
+2. exige que o **status persistido** — não o do objeto recebido — seja `accepted`;
+3. compara `target` contra o registro persistido nos campos que definem o que será lido e com que instrução — `url`, `kind`, `note`, `focus`, `local_path` — mais o próprio `status`; qualquer divergência recusa a execução;
+4. devolve o **registro persistido**, que passa a ser o objeto usado no resto de `run()` — o objeto recebido do chamador deixa de ser lido para qualquer efeito.
+
+A nova exceção `TargetApprovalMismatchError(TargetNotApprovedError)` cobre os casos de registro ausente e de divergência de campo; a mensagem nomeia os **nomes dos campos** divergentes e nunca os valores — `url` e `note` são conteúdo escolhido por quem montou o objeto, sem motivo para ecoar em log ou terminal —, e indica o comando de reaprovação (`fpch canib accept <id>`). Por ser subclasse de `TargetNotApprovedError`, qualquer chamador que já tratasse a exceção antiga continua funcionando sem alteração.
+
+A aprovação passou a cobrir também a troca **posterior** da fonte: `set_local_path(id, novo_caminho)` e `add(..., local_path=...)` sobre um alvo existente agora passam pela função interna `_change_local_path`, que devolve o alvo a `pending` quando `local_path` muda e o alvo estava `accepted` — o mesmo valor não revoga nada, porque não há fonte nova a aprovar. O chamador distingue a revogação lendo o `status` do alvo devolvido; a função `reapproval_hint(id)` produz a linha acionável para mostrar ao humano.
+
+## 27. TOCTOU numa execução longa: reconferência antes de gravar a ficha
+
+Uma execução de `run()` chama o roteador duas vezes (extração e proposta) e pode levar minutos. Nesse intervalo, um humano pode ter rejeitado o alvo pela CLI, ou outra automação pode ter alterado a fonte. Antes desta correção, o resultado dessas chamadas era gravado como ficha e o alvo marcado `done` sem qualquer nova checagem.
+
+Agora, depois das duas chamadas ao roteador e **antes** de escrever a ficha em disco, `run()` relê a fila (`_load()`) e chama `_verify_approval` de novo contra o registro atual. Se a aprovação mudou — rejeição, edição de campo ou remoção do registro — a função levanta `TargetApprovalMismatchError` com o motivo "a aprovação mudou durante a execução", **nenhuma ficha é escrita e o alvo não é marcado como `done`**. A mesma leitura da fila sustenta tanto a reconferência quanto a gravação final: `content = _render(...)` é calculado antes da checagem, mas só é escrito em disco depois dela passar, e a marcação `current.status = STATUS_DONE` / `current.fiche_path = str(path)` seguida de `_save(targets)` usa o registro já revalidado, num único `_save`.
+
+A escolha é deliberada e está documentada no docstring de `run()`: escrever a ficha e depois apagá-la em caso de rejeição tardia deixaria um artefato órfão se o processo morresse entre as duas operações; o que já foi enviado aos backends não tem como ser "desenviado" — a revogação tardia impede o **registro** do resultado, não o custo nem a exposição do prompt que já ocorreram.
+
+## 28. Falha fechada sobre fila malformada
+
+`_load()` deixou de assumir `Target(**t)` sobre qualquer JSON. A nova validação, antes de construir qualquer `Target`, recusa: JSON ilegível (erro de decodificação ou leitura), topo que não é uma lista, item que não é um objeto, item com chave desconhecida (fora do conjunto de campos de `Target`), item sem alguma das chaves obrigatórias (`url`, `kind`, `id`) e campo com tipo diferente do esperado (string, ou `None` nos dois campos opcionais). Cada falha levanta `QueueFormatError`, uma nova exceção própria do módulo, com mensagem que localiza o item pelo índice na lista.
+
+A fila real de canibalização em uso neste repositório (`~/.fpch/cannibalize.json`, **13 entradas**) foi conferida contra a validação nova em modo só leitura — carrega sem erro — e seu `mtime` (17/07/2026 20:03:49) foi preservado, sem escrita incidental durante a verificação. `fpch canib list` foi exercitado contra essa mesma fila real.
+
+Na CLI, `_cmd_canib` (em `cli.py`) foi dividido: a função original virou `_cmd_canib_dispatch`, e um novo `_cmd_canib` externo envolve a chamada, captura `QueueFormatError` e imprime `erro: <mensagem>` em `stderr`, retornando código de saída 1 em vez de deixar o traceback subir. Essa captura externa cobre subcomandos como `list` e `accept`, que chamam `_load()` diretamente e não tinham nenhum tratamento próprio de erro de formato. `run` e `runall` já continham `except RuntimeError as exc` local para tratar `TargetNotApprovedError` — como `QueueFormatError` também é `RuntimeError` (embora não relacionada por herança a `TargetNotApprovedError`), esses dois subcomandos já capturavam o erro novo sem precisar de mudança.
+
+O docstring do módulo — a seção que começa com "ONDE MORA O PORTÃO" — foi atualizado nesta primeira passada para descrever a conferência contra o registro persistido, e não mais apenas contra `target.status` do objeto recebido. **A formulação do limite dessa primeira passada ainda superafirmava o alcance do portão — corrigido na segunda rodada, §29.**
+
+## 29. Segunda rodada: o docstring superafirmava o alcance do portão
+
+A revisão independente pedida sobre o corte de C17 encontrou **0 problemas bloqueadores, 5 riscos e 1 *nit*, todos endereçados**. O achado mais importante não foi um bug de comportamento: foi uma frase do próprio docstring do módulo, escrita na primeira passada, dizendo que o portão "protege contra o contorno programático dentro do processo". A frase é falsa. Código no mesmo processo pode aprovar um alvo sem passar por `fpch canib accept` de nenhuma forma reconhecida como aprovação humana — por exemplo chamando `set_status(id, "accepted")` diretamente, chamando `_save(targets)` sobre uma lista editada à mão, ou reatribuindo `QUEUE_PATH` para apontar a um arquivo forjado. O portão de `_verify_approval` não tem como distinguir esse caminho de um `fpch canib accept` genuíno: para ele, um registro com `status == "accepted"` na fila **é** uma aprovação, não importa como chegou lá.
+
+**Isto é quase-repetição do modo de falha documentado em [`docs/decisoes/protecao-fantasma-no-laco-2026-09-03.md`](../decisoes/protecao-fantasma-no-laco-2026-09-03.md):** uma garantia de segurança declarada em prosa além do que o código de fato impõe, descoberta não pelo comportamento observado (o portão sempre recusou o que deveria recusar nos testes) mas pela leitura crítica da alegação em si. A diferença para o episódio de 03/09/2026 é que ali a proteção fantasma vinha de um campo de política que não governava o hook — aqui a "proteção fantasma" é textual: o código nunca prometeu mais do que faz, mas o comentário prometia.
+
+O docstring foi reescrito com uma seção «O LIMITE» que substitui a alegação errada pela precisa:
+
+- O portão recusa, em relação à fila persistida, objetos forjados, obsoletos ou divergentes, e fontes trocadas depois da aprovação.
+- Ele **não** distingue um `fpch canib accept` humano de código que chama a API da fila (`set_status`, `_save`), reatribui `QUEUE_PATH` ou grava `~/.fpch/cannibalize.json` diretamente — no mesmo processo ou fora dele. Para o portão, tudo isso é aprovação.
+- Aprovação fora de banda de verdade exigiria algo fora do processo (uma confirmação que o próprio agente não consegue produzir); isso **não está implementado**.
+- A aprovação fixa a **string** de `local_path`, não o conteúdo do diretório: arquivos trocados dentro do mesmo caminho depois da aprovação passam sem disparar revogação.
+
+As mensagens das três exceções do módulo (`TargetNotApprovedError`, `TargetApprovalMismatchError` e a nova `ApprovedSourceMissingError`, §30) foram alinhadas a essa formulação: onde diziam algo que sugeria uma garantia mais forte, passaram a dizer "a canibalização exige aprovação explícita registrada na fila" — nem mais, nem menos do que o código garante.
+
+## 30. Segunda rodada: fonte local ausente falha fechado, e ids forjados são escapados
+
+Dois riscos adicionais da revisão, também corrigidos:
+
+**Fonte local aprovada que desaparece.** Antes deste corte, se o registro aprovado tinha `local_path` mas o diretório não existia mais na hora de `run()`, o código não tratava esse caso explicitamente e podia acabar caindo no ramo de busca por URL — trocando silenciosamente a fonte que fora aprovada por outra. Nova exceção `ApprovedSourceMissingError(RuntimeError)` e função `_require_local_source(target)`: se `target.local_path` está definido e `Path(target.local_path).is_dir()` é falso, `run()` recusa **antes de qualquer chamada ao roteador**. A mesma checagem é repetida imediatamente antes da validação de citações (`citations.validate`), porque a execução entre as duas chamadas ao roteador pode levar minutos e a fonte pode ter sumido nesse intervalo — sem essa segunda checagem, uma ficha sem validação de citações ainda poderia ser gravada.
+
+**Ids forjados em mensagens de erro.** Um `Target` construído à mão pelo chamador, ou um item de fila malformado, pode trazer um `id` (ou `status`) que não segue o formato interno (`[0-9a-f]{8}}`, oito caracteres hexadecimais). Antes deste corte, esse valor ia cru para a mensagem de exceção, que por sua vez pode acabar em terminal ou arquivo de log — vetor de injeção de sequência ANSI ou de linha de log forjada. Nova função `_safe_text`: qualquer caractere fora do intervalo ASCII imprimível (controle, ESC, quebra de linha, não-ASCII) e a própria barra invertida viram escape `\uXXXX`; o resultado é cortado em **40 caracteres**. `_shown_id` decide, por `id`, se ele está no formato esperado (aparece como está, e o comando sugerido usa o id real) ou fora dele (aparece escapado entre aspas, e o comando sugerido usa um marcador genérico `<id>` em vez de ecoar o valor forjado). As três classes de exceção do módulo (`TargetNotApprovedError`, `TargetApprovalMismatchError`, e a mensagem que `ApprovedSourceMissingError` produz a partir do mesmo `id`) passam por esse tratamento.
+
+Na suíte, `test_run_usa_o_registro_persistido` foi reescrito para mutar o objeto `Target` **depois** de passá-lo a `run()` (simulando um chamador que mantém uma referência e a edita) e afirmar que o comportamento observado usa os valores do registro persistido, não os da mutação; o teste de id duplicado na fila passou a rodar nas duas ordens possíveis (`aprovado-primeiro`, `pendente-primeiro`), porque a ordem de iteração não deveria mudar o veredito; e três testes de regressão novos na CLI cobrem `add`, `reject` e `list` contra a validação de formato de fila. Cinco checagens de mutação adicionais desta rodada foram cada uma capturada por um teste novo ou reforçado.
+
+## 31. Verificação executada após C17 (quarto corte, segunda rodada)
+
+| Verificação | Resultado em 13/09/2026 (quarto corte, segunda rodada) |
+|---|---|
+| Suíte completa | **808 passed, 12 skipped em 12,97 s** (era 794 passed, 12 skipped) |
+| Código do protótipo | **16 módulos, 11.089 linhas físicas em `src/fpch/`** |
+| Testes | **20 arquivos, 10.144 linhas físicas em `tests/`** |
+| `tests/test_cannibalize.py` | de 8 para **37 testes coletados** (24 funções, 4 delas com `parametrize`) |
+| `tests/test_cannibalize_cli.py` (novo) | **14 testes coletados** (11 funções, 3 delas com `parametrize`) |
+| Fila real (`~/.fpch/cannibalize.json`) | **13 entradas**, carregada só leitura, `mtime` de 17/07/2026 preservado |
+| `fpch canib list` contra a fila real | executado, sem escrita |
+| Testes de mutação | checagem original (remover a checagem de entrada, a segunda checagem TOCTOU ou o *reset* de `local_path`) mais **5 checagens adicionais da segunda rodada** — cada uma capturada por um teste |
+| Revisão independente | **concluída: 0 bloqueadores, 5 riscos e 1 *nit*, todos endereçados** |
+| Commit | `eace234` — `fix(canib): verify approval against the persisted queue (C17)` |
+| Grafo graphify | **não recalculado nesta sessão** — seguem valendo 5.478/6.790/497 do corte de C16 |
+| Entregáveis acadêmicos | congelados e sem alteração nesta fatia |
+
+## 32. Limites residuais do corte, e o que continua em aberto
+
+- Quem tem escrita direta em `~/.fpch/cannibalize.json`, ou código no mesmo processo que chama `set_status`/`_save`/reatribui `QUEUE_PATH`, ainda aprova qualquer alvo — o portão recusa objeto forjado, obsoleto ou divergente **em relação à fila persistida**, mas não distingue quem ou o quê escreveu o `"accepted"` nela. Fechar isso exigiria aprovação assinada fora do alcance do agente, que não existe neste corte (ver §29).
+- A aprovação fixa a **string** de `local_path`, não o conteúdo do diretório: arquivos trocados dentro do mesmo caminho aprovado, depois da aprovação, não disparam revogação (ver §30).
+- Não há trava de arquivo (*file lock*) sobre a fila: entre a segunda verificação (antes de escrever a ficha) e a gravação de `done`, resta uma janela curta — a mesma propriedade de todo leitor-modificador-gravador do módulo, já registrada em cortes anteriores para outras partes do FPCH.
+- Uma rejeição no meio da execução não desfaz chamadas de backend já feitas: o custo de cota e a exposição do prompt já ocorreram; o que a reconferência impede é o **registro** do resultado como concluído.
+- Uma fila gravada por uma versão futura do FPCH, com chaves adicionais em `Target`, falha fechada como `QueueFormatError` em vez de ignorar os campos desconhecidos — decisão deliberada de não adivinhar formato, com o custo de exigir migração explícita se o esquema de `Target` crescer.
+
+**Candidatos ao próximo passo, não decisão:** **C18** (substituir `_FAILURE_SIGNATURES` — lista literal de mensagens de erro de terceiro em `backends.py:81-90` — por validação mais robusta) e **C19** (capturar mais que `BackendUnavailable` no laço de escalada de `router.py:85-99`) são dívidas de engenharia identificadas no mesmo levantamento, sem decisão pendente do autor — ambas descritas no `TODO.md`. C4 e C7 continuam parciais; C15, C23 e C25 continuam abertos.
