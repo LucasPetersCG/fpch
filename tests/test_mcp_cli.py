@@ -163,3 +163,155 @@ def test_mcp_verify_does_not_use_network_or_processes(
 
     assert cli.main(["mcp", "verify", str(checkpoint), str(artifact)]) == 0
     capsys.readouterr()
+
+
+# --- `fpch mcp scan` -----------------------------------------------------------
+
+
+def test_mcp_scan_clean_exit_zero_and_json_matches_library(
+    tmp_path, monkeypatch, capsys
+) -> None:
+    path = tmp_path / "meta.json"
+    path.write_text(json.dumps({"tools": [{"description": "ola"}]}), encoding="utf-8")
+    _without_policy(monkeypatch, tmp_path)
+
+    assert cli.main(["mcp", "scan", str(path)]) == 0
+    human = capsys.readouterr()
+    assert "metadados MCP: limpos" in human.out
+    assert "nada foi executado, extraído ou gravado" in human.out
+    assert human.err == ""
+
+    assert cli.main(["mcp", "scan", str(path), "--json"]) == 0
+    captured = capsys.readouterr()
+    expected = mcp.dumps_scan(mcp.scan_metadata(path))
+    assert captured.out == expected
+    assert captured.err == ""
+
+
+def test_mcp_scan_findings_exit_one_ascii_safe_in_json_key(
+    tmp_path, monkeypatch, capsys
+) -> None:
+    hidden_key = "descricao" + chr(0x202E)  # bidi override escondido na CHAVE
+    hidden_value = "tag oculta" + chr(0xE0041)  # payload TAG escondido no VALOR
+    payload = {hidden_key: hidden_value}
+    path = tmp_path / "meta.json"
+    path.write_bytes(json.dumps(payload, ensure_ascii=False).encode("utf-8"))
+    _without_policy(monkeypatch, tmp_path)
+
+    assert cli.main(["mcp", "scan", str(path)]) == 1
+    captured = capsys.readouterr()
+    # O ponto que importa: os pontos de código escondidos nunca chegam crus ao
+    # terminal — nem na chave nem no valor — só a forma escapada `\uXXXX`/`\UXXXXXXXX`.
+    # (a mensagem em PT-BR usa acentos legítimos, então não se exige ASCII puro.)
+    assert chr(0x202E) not in captured.out
+    assert chr(0xE0041) not in captured.out
+    # O bidi escondido está na CHAVE; o `pointer` reportado é sanitizado, então ele
+    # vira U+FFFD (impresso escapado) e nunca aparece nem como `‮`. O TAG está
+    # só no VALOR — aparece apenas como texto seguro "U+E0041".
+    assert "\\u202e" not in captured.out
+    assert "/descricao\\ufffd" in captured.out
+    assert "U+202E" in captured.out
+    assert "U+E0041" in captured.out
+    assert "metadados MCP: Unicode oculto encontrado" in captured.out
+    assert "(chave)" in captured.out
+    assert "bidi" in captured.out
+    assert "tag" in captured.out
+    assert "nada foi executado, extraído ou gravado" in captured.out
+    assert captured.err == ""
+
+
+def test_mcp_scan_findings_exit_one_ascii_safe_in_text(
+    tmp_path, monkeypatch, capsys
+) -> None:
+    content = "linha limpa\ncom TAG oculta" + chr(0xE0041) + "\n"
+    path = tmp_path / "meta.txt"
+    path.write_bytes(content.encode("utf-8"))
+    _without_policy(monkeypatch, tmp_path)
+
+    assert cli.main(["mcp", "scan", str(path)]) == 1
+    captured = capsys.readouterr()
+    assert chr(0xE0041) not in captured.out
+    assert "linha 2" in captured.out
+    assert "tag" in captured.out
+    assert captured.err == ""
+
+
+def test_mcp_scan_text_marks_escaped_findings(tmp_path, monkeypatch, capsys) -> None:
+    backslash = chr(0x5C)
+    content = "leia" + backslash + "udb40" + backslash + "udc41\n"
+    path = tmp_path / "meta.txt"
+    path.write_bytes(content.encode("ascii"))
+    _without_policy(monkeypatch, tmp_path)
+
+    assert cli.main(["mcp", "scan", str(path)]) == 1
+    captured = capsys.readouterr()
+    assert "linha 1, coluna 5: U+E0041 tag (escapado)" in captured.out
+
+    assert cli.main(["mcp", "scan", str(path), "--json"]) == 1
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["findings"][0]["escaped"] is True
+
+
+def test_mcp_scan_json_marks_truncated_pointer(tmp_path, monkeypatch, capsys) -> None:
+    path = tmp_path / "meta.json"
+    path.write_bytes(json.dumps({"k" * 5000: chr(0x200B)}).encode("ascii"))
+    _without_policy(monkeypatch, tmp_path)
+
+    assert cli.main(["mcp", "scan", str(path)]) == 1
+    captured = capsys.readouterr()
+    assert "(pointer truncado): U+200B zero_width" in captured.out
+    assert len(captured.out) < 2000
+
+
+def test_mcp_scan_format_override(tmp_path, monkeypatch, capsys) -> None:
+    content = '{"description": "com' + chr(0x200B) + 'escondido"}'
+    path = tmp_path / "meta.dat"  # sufixo neutro: `auto` cairia em modo texto
+    path.write_bytes(content.encode("utf-8"))
+    _without_policy(monkeypatch, tmp_path)
+
+    assert cli.main(["mcp", "scan", str(path)]) == 1
+    as_text = capsys.readouterr()
+    assert "linha 1" in as_text.out
+
+    assert cli.main(["mcp", "scan", str(path), "--format", "json"]) == 1
+    as_json = capsys.readouterr()
+    assert "/description" in as_json.out
+
+
+def test_mcp_scan_error_exit_two(tmp_path, monkeypatch, capsys) -> None:
+    _without_policy(monkeypatch, tmp_path)
+    missing = tmp_path / "ausente.json"
+
+    assert cli.main(["mcp", "scan", str(missing)]) == cli.EXIT_USO
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "erro de varredura MCP" in captured.err
+
+
+def test_mcp_scan_usage_errors_exit_two(tmp_path, monkeypatch) -> None:
+    _without_policy(monkeypatch, tmp_path)
+
+    for argv in (["mcp", "scan"], ["mcp", "scan", "a", "--format", "invalido"]):
+        with pytest.raises(SystemExit) as exc:
+            cli.main(argv)
+        assert exc.value.code == 2
+
+
+def test_mcp_scan_does_not_use_network_or_processes(
+    tmp_path, monkeypatch, capsys
+) -> None:
+    path = tmp_path / "meta.json"
+    path.write_text(json.dumps({"description": "ola"}), encoding="utf-8")
+    _without_policy(monkeypatch, tmp_path)
+
+    def forbidden(*_args, **_kwargs):
+        pytest.fail("fpch mcp scan não pode acessar rede ou executar processo")
+
+    monkeypatch.setattr(socket, "socket", forbidden)
+    monkeypatch.setattr(socket, "create_connection", forbidden)
+    monkeypatch.setattr(urllib.request, "urlopen", forbidden)
+    monkeypatch.setattr(subprocess, "run", forbidden)
+    monkeypatch.setattr(subprocess, "Popen", forbidden)
+
+    assert cli.main(["mcp", "scan", str(path)]) == 0
+    capsys.readouterr()

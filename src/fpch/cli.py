@@ -89,6 +89,27 @@ def _safe_cli_error(error: BaseException, *, limit: int = 500) -> str:
     return safe if len(safe) <= limit else safe[:limit] + "…"
 
 
+def _ascii_escape(text: str) -> str:
+    """Converte todo caractere não-ASCII ou não-imprimível em ``\\uXXXX``/``\\UXXXXXXXX``.
+
+    Mais estrito que `_safe_cli_error`: seletores de variação e outras marcas
+    combinantes contam como "imprimíveis" para `str.isprintable()` (categoria
+    Mn, não Cf/Cc), então `_safe_cli_error` sozinho deixaria passar Unicode
+    oculto para o terminal. Aqui, só ASCII imprimível atravessa sem escape.
+    """
+    result: list[str] = []
+    for character in text:
+        if character.isascii() and character.isprintable():
+            result.append(character)
+            continue
+        code_point = ord(character)
+        if code_point > 0xFFFF:
+            result.append(f"\\U{code_point:08x}")
+        else:
+            result.append(f"\\u{code_point:04x}")
+    return "".join(result)
+
+
 def _is_linklike(path: Path) -> bool:
     """Reconhece links, junctions e outros reparse points sem segui-los."""
     try:
@@ -589,6 +610,64 @@ def _cmd_setup_apply(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_mcp_scan(args: argparse.Namespace) -> int:
+    """`fpch mcp scan FILE` — varredura offline de Unicode oculto em metadados MCP.
+
+    Somente leitura: nunca baixa, extrai, executa ou grava nada. Saída 0 =
+    limpo; 1 = achado (resultado ainda é impresso); 2 = `FpchMcpError` ou
+    erro de uso.
+    """
+    try:
+        result = mcp.scan_metadata(Path(args.file), format=args.format)
+        payload = mcp.dumps_scan(result)
+    except mcp.FpchMcpError as exc:
+        print(f"erro de varredura MCP: {_ascii_escape(str(exc))}", file=sys.stderr)
+        return EXIT_USO
+
+    if args.json:
+        print(payload, end="")
+        return 0 if result.clean else 1
+
+    status = "limpos" if result.clean else "Unicode oculto encontrado"
+    print(f"metadados MCP: {status}")
+    print(f"formato: {result.format}")
+    print(f"tamanho: {result.size_bytes} bytes")
+    print(f"sha256: {result.sha256}")
+    print(f"unicode_version: {result.unicode_version}")
+    print(f"ruleset: {result.ruleset}")
+    print(f"BOM inicial: {'sim' if result.leading_bom else 'não'}")
+
+    if result.counts:
+        print("achados por classe:")
+        for name, count in result.counts:
+            print(f"  {name}: {count}")
+
+    for finding in result.findings:
+        code = f"U+{finding.code_point:04X}"
+        if result.format == "text":
+            escaped_suffix = " (escapado)" if finding.escaped else ""
+            print(
+                f"  linha {finding.line}, coluna {finding.column}: "
+                f"{code} {finding.category}{escaped_suffix}"
+            )
+        else:
+            pointer = _ascii_escape(finding.pointer)
+            key_suffix = " (chave)" if finding.in_key else ""
+            if finding.pointer_truncated:
+                key_suffix += " (pointer truncado)"
+            print(
+                f"  {pointer} [índice {finding.index}]{key_suffix}: "
+                f"{code} {finding.category}"
+            )
+
+    if result.truncated:
+        omitted = result.findings_total - len(result.findings)
+        print(f"… e mais {omitted} achados omitidos")
+
+    print("nada foi executado, extraído ou gravado")
+    return 0 if result.clean else 1
+
+
 def _cmd_mcp_verify(args: argparse.Namespace) -> int:
     """Confere um artefato local contra um checkpoint MCP; nunca escreve arquivos.
 
@@ -1066,6 +1145,20 @@ def build_parser() -> argparse.ArgumentParser:
     mcve.add_argument("artifact", metavar="ARTEFATO", help="arquivo local do artefato")
     mcve.add_argument("--json", action="store_true", help="emite o resultado em JSON canônico")
     mcve.set_defaults(fn=_cmd_mcp_verify)
+
+    mcsc = mcsub.add_parser(
+        "scan",
+        help="varre metadados MCP (tools/list, manifesto) em busca de Unicode oculto (somente leitura)",
+    )
+    mcsc.add_argument("file", metavar="FILE", help="arquivo de metadados MCP a varrer")
+    mcsc.add_argument("--json", action="store_true", help="emite o resultado em JSON canônico")
+    mcsc.add_argument(
+        "--format",
+        choices=["auto", "json", "text"],
+        default="auto",
+        help="formato da varredura (default: auto, pela extensão .json)",
+    )
+    mcsc.set_defaults(fn=_cmd_mcp_scan)
 
     au = sub.add_parser("audit", help="resumo de uso por pool")
     au.add_argument("--verify", action="store_true",
