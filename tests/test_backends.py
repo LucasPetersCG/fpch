@@ -17,6 +17,7 @@ Rodar: `uv run --with pytest pytest tests/ -q`
 
 from __future__ import annotations
 
+import re
 import subprocess
 
 import pytest
@@ -43,14 +44,48 @@ def _model(backend: str) -> Model:
     )
 
 
+RESPOSTA_PLAUSIVEL = "resposta longa o bastante para nao disparar o limiar de 40 chars"
+
+_NONCE_NA_INSTRUCAO = re.compile(r"this code: ([0-9a-f]{16})")
+
+
+def _nonce(argv: list[str]) -> str:
+    """O nonce que `invoke` pôs na instrução — lido do argv, como o modelo leria."""
+    achados = {m.group(1) for tok in argv for m in _NONCE_NA_INSTRUCAO.finditer(tok)}
+    assert len(achados) == 1, f"esperava exatamente um nonce no argv, achei {achados}"
+    return achados.pop()
+
+
+def _sentinela(argv: list[str]) -> str:
+    return f"FPCH-FIM-{_nonce(argv)}"
+
+
+def _responde(monkeypatch, fabrica):
+    """Instala `_run` falso cuja saída é `fabrica(argv)` → (exit, texto)."""
+    chamadas: list[list[str]] = []
+
+    def fake_run(argv, timeout_s, cwd=None):
+        chamadas.append(argv)
+        return fabrica(argv)
+
+    monkeypatch.setattr(backends, "_run", fake_run)
+    monkeypatch.setattr(backends.shutil, "which", lambda b: f"/fake/bin/{b}")
+    return chamadas
+
+
 @pytest.fixture
 def capturado(monkeypatch):
-    """Substitui `_run` por captura. Devolve a lista de chamadas feitas."""
+    """Substitui `_run` por captura. Devolve a lista de chamadas feitas.
+
+    A saída falsa CUMPRE o contrato de saída (C18): ecoa a sentinela da chamada,
+    como um modelo obediente faria. Quem precisa de saída que não cumpre usa
+    `_responde` diretamente.
+    """
     chamadas: list[dict] = []
 
     def fake_run(argv, timeout_s, cwd=None):
         chamadas.append({"argv": argv, "timeout_s": timeout_s, "cwd": cwd})
-        return 0, "resposta longa o bastante para nao disparar o limiar de 40 chars"
+        return 0, f"{RESPOSTA_PLAUSIVEL}\n{_sentinela(argv)}"
 
     monkeypatch.setattr(backends, "_run", fake_run)
     monkeypatch.setattr(backends.shutil, "which", lambda b: f"/fake/bin/{b}")
@@ -76,7 +111,10 @@ def test_argv_agy_caso_simples(tmp_path, capturado):
     backends.invoke(_model("agy"), "oi", workdir=tmp_path)
     argv = _argv(capturado)
     assert argv[0] == "agy"
-    assert argv[:5] == ["agy", "--model", "modelo-de-teste", "-p", "oi"]
+    assert argv[:4] == ["agy", "--model", "modelo-de-teste", "-p"]
+    # O prompt efetivo é o do chamador seguido da instrução do contrato (C18).
+    assert argv[4].startswith("oi\n")
+    assert "OUTPUT CONTRACT" in argv[4]
     assert "--sandbox" in argv
 
 
@@ -85,7 +123,9 @@ def test_argv_copilot_caso_simples(tmp_path, capturado):
     argv = _argv(capturado)
     assert argv[0] == "copilot"
     assert _pares(argv, "-C") == [str(tmp_path)]
-    assert argv[-2:] == ["-p", "oi"]
+    assert argv[-2] == "-p" and argv[-1].startswith("oi\n")
+    # Sem `--silent`, as estatísticas do copilot viriam depois da sentinela.
+    assert "--silent" in argv
 
 
 def test_argv_claude_caso_simples(tmp_path, capturado):
@@ -95,7 +135,7 @@ def test_argv_claude_caso_simples(tmp_path, capturado):
     # O prompt do `claude` é POSICIONAL depois de `-p`, e as opções variádicas
     # (`--disallowedTools`, `--add-dir`) engolem valor solto que venha depois.
     # Por isso `-p <prompt>` tem de ser o final do argv.
-    assert argv[-2:] == ["-p", "oi"]
+    assert argv[-2] == "-p" and argv[-1].startswith("oi\n")
 
 
 @pytest.mark.parametrize("backend", BACKENDS)
@@ -317,9 +357,48 @@ def test_prompt_longo_e_encaminhado_ou_recusado(tmp_path, capturado, backend):
     assert longo not in argv, "prompt gigante não pode ir na linha de comando"
     encaminhados = list(tmp_path.glob("fpch-prompt-*.md"))
     assert len(encaminhados) == 1
-    assert encaminhados[0].read_text(encoding="utf-8") == longo
+    conteudo = encaminhados[0].read_text(encoding="utf-8")
+    assert conteudo.startswith(longo)
     # O prompt efetivo passa a ser um ponteiro para o arquivo encaminhado.
     assert any(str(encaminhados[0]) in tok for tok in argv)
+    # C18: a instrução do contrato chega ao modelo pelos dois caminhos — no fim
+    # do arquivo encaminhado e no fim do ponteiro —, com o MESMO nonce.
+    nonce = _nonce(argv)  # achado no argv = está no ponteiro
+    assert conteudo.find("OUTPUT CONTRACT") >= len(longo), "instrução tem de vir depois da tarefa"
+    assert f"this code: {nonce}" in conteudo[len(longo):]
+
+
+def _encaminhou(tmp_path) -> bool:
+    return bool(list(tmp_path.glob("fpch-prompt-*.md")))
+
+
+def test_limite_de_argv_e_medido_com_a_instrucao_somada(tmp_path, capturado):
+    """Prompt que cabe sozinho, mas estoura com a instrução, TEM de ir para arquivo.
+
+    Medir só o prompt do chamador deixaria passar para a linha de comando um
+    argumento maior que `_ARG_LIMIT` — exatamente o que o limite existe para impedir.
+    """
+    tamanho = backends._ARG_LIMIT - backends.FPCH_CONTRATO_INSTRUCAO_CHARS + 1
+    assert tamanho <= backends._ARG_LIMIT, "premissa: sozinho, o prompt cabe"
+    backends.invoke(_model("agy"), "p" * tamanho, workdir=tmp_path)
+    assert _encaminhou(tmp_path)
+    assert all(len(tok) <= backends._ARG_LIMIT for tok in _argv(capturado))
+
+
+@pytest.mark.parametrize("folga", [0, 1])
+def test_prompt_com_instrucao_exatamente_no_limite_ou_abaixo_nao_encaminha(
+    tmp_path, capturado, folga
+):
+    tamanho = backends._ARG_LIMIT - backends.FPCH_CONTRATO_INSTRUCAO_CHARS - folga
+    backends.invoke(_model("agy"), "p" * tamanho, workdir=tmp_path)
+    assert not _encaminhou(tmp_path)
+    [efetivo] = _pares(_argv(capturado), "-p")
+    assert len(efetivo) == backends._ARG_LIMIT - folga
+
+
+def test_acrescimo_da_instrucao_e_constante():
+    a, b = backends.FpchContratoSaida.novo(), backends.FpchContratoSaida.novo()
+    assert len(a.instrucao) == len(b.instrucao) == backends.FPCH_CONTRATO_INSTRUCAO_CHARS
 
 
 @pytest.mark.parametrize("backend", BACKENDS)
@@ -372,17 +451,15 @@ def test_resposta_real_passa():
 
 
 def test_falha_semantica_com_exit_zero_nao_vira_sucesso(tmp_path, monkeypatch):
-    """A lição de 16/07/2026: `exit == 0` não é contrato de sucesso."""
-    monkeypatch.setattr(backends.shutil, "which", lambda b: f"/fake/bin/{b}")
-    monkeypatch.setattr(
-        backends,
-        "_run",
-        lambda argv, timeout_s, cwd=None: (0, "jetski: no output produced - auto-denied"),
-    )
+    """A lição de 16/07/2026: `exit == 0` não é contrato de sucesso.
+
+    Sem sentinela, quem reprova é o contrato — antes mesmo da lista de negação.
+    """
+    _responde(monkeypatch, lambda argv: (0, "jetski: no output produced - auto-denied"))
     r = backends.invoke(_model("agy"), "oi", workdir=tmp_path)
     assert r.ok is False
     assert r.exit_code == 0
-    assert "falha semântica" in (r.error or "")
+    assert (r.error or "").startswith(backends.FPCH_ERRO_SENTINELA_AUSENTE)
 
 
 # ---------------------------------------------------------------------------
@@ -442,7 +519,314 @@ def test_todo_adaptador_declara_regime_completo(backend):
         "workdir",
         "extra_dirs",
         "prompt_longo",
+        "saida_estruturada",
     ):
         cap = getattr(regime, eixo)
         assert isinstance(cap, backends.Capacidade)
         assert cap.mecanismo.strip(), f"{backend}.{eixo} sem mecanismo declarado"
+
+
+# ---------------------------------------------------------------------------
+# Contrato de saída — sentinela com nonce por chamada (C18)
+# ---------------------------------------------------------------------------
+
+
+def test_sentinela_presente_da_ok_e_some_do_texto(tmp_path, monkeypatch):
+    _responde(monkeypatch, lambda argv: (0, f"{RESPOSTA_PLAUSIVEL}\n{_sentinela(argv)}"))
+    r = backends.invoke(_model("claude"), "oi", workdir=tmp_path)
+    assert r.ok is True
+    assert r.error is None
+    assert r.contract == backends.FPCH_CONTRATO_SENTINELA
+    assert r.text == RESPOSTA_PLAUSIVEL
+    assert "FPCH-FIM" not in r.text
+
+
+def test_sem_sentinela_exit_zero_e_texto_plausivel_e_falha(tmp_path, monkeypatch):
+    longo = "Aqui está a análise completa do repositório, com arquitetura e riscos. " * 5
+    _responde(monkeypatch, lambda argv: (0, longo))
+    r = backends.invoke(_model("agy"), "oi", workdir=tmp_path)
+    assert r.ok is False
+    assert r.exit_code == 0
+    assert (r.error or "").startswith(backends.FPCH_ERRO_SENTINELA_AUSENTE)
+
+
+def test_regressao_c18_erro_de_fornecedor_fora_da_lista_de_negacao(tmp_path, monkeypatch):
+    """O teste de C18: redação de erro que a lista de negação nunca viu.
+
+    Antes, `exit 0` + texto com mais de 40 caracteres + nenhuma das 8 frases
+    conhecidas = sucesso. Foi assim que uma mensagem de erro virou artefato.
+    """
+    erro = "service temporarily degraded, please retry your request in a few minutes"
+    assert backends.looks_like_failure(erro) is None, "premissa: a lista não conhece a frase"
+    _responde(monkeypatch, lambda argv: (0, erro))
+    r = backends.invoke(_model("agy"), "oi", workdir=tmp_path)
+    assert r.ok is False
+    assert (r.error or "").startswith(backends.FPCH_ERRO_SENTINELA_AUSENTE)
+
+
+def test_instrucao_nunca_contem_a_sentinela_inteira():
+    contrato = backends.FpchContratoSaida.novo()
+    assert contrato.sentinela not in contrato.instrucao
+    assert contrato.nonce in contrato.instrucao
+
+
+@pytest.mark.parametrize("backend", BACKENDS)
+def test_eco_do_prompt_com_a_instrucao_nao_cumpre_o_contrato(tmp_path, monkeypatch, backend):
+    """Erro de fornecedor que cita o prompt carrega a instrução — e o nonce."""
+
+    def ecoa(argv):
+        prompt = argv[argv.index("-p") + 1]
+        return 0, f"Error: request could not be completed. Original prompt follows:\n{prompt}"
+
+    _responde(monkeypatch, ecoa)
+    r = backends.invoke(_model(backend), "oi, analise o repositorio", workdir=tmp_path)
+    assert r.ok is False
+    assert (r.error or "").startswith(backends.FPCH_ERRO_SENTINELA_AUSENTE)
+
+
+def test_eco_truncado_logo_depois_do_nonce_nao_cumpre(tmp_path, monkeypatch):
+    """Eco cortado bem no nonce: a última linha termina no código, mas não é a sentinela."""
+
+    def ecoa_truncado(argv):
+        prompt = argv[argv.index("-p") + 1]
+        corte = prompt.index(_nonce(argv)) + 16
+        return 0, "upstream error while echoing input:\n" + prompt[:corte]
+
+    _responde(monkeypatch, ecoa_truncado)
+    r = backends.invoke(_model("agy"), "oi", workdir=tmp_path)
+    assert r.ok is False
+    assert (r.error or "").startswith(backends.FPCH_ERRO_SENTINELA_AUSENTE)
+
+
+def test_sentinela_de_outra_chamada_nao_cumpre(tmp_path, monkeypatch):
+    alheia = "FPCH-FIM-" + "0123456789abcdef"
+    _responde(monkeypatch, lambda argv: (0, f"{RESPOSTA_PLAUSIVEL}\n{alheia}"))
+    r = backends.invoke(_model("agy"), "oi", workdir=tmp_path)
+    assert r.ok is False
+    assert (r.error or "").startswith(backends.FPCH_ERRO_SENTINELA_AUSENTE)
+    # Nonce alheio não é marca desta chamada: fica no texto, como conteúdo.
+    assert alheia in r.text
+
+
+def test_conteudo_depois_da_sentinela_nao_cumpre(tmp_path, monkeypatch):
+    """Regra escolhida: sentinela é a ÚLTIMA linha não-vazia.
+
+    Conteúdo depois do fim declarado é a forma de um erro anexado pelo
+    fornecedor — aceitar "última ocorrência" deixaria isto passar.
+    """
+    _responde(
+        monkeypatch,
+        lambda argv: (0, f"{RESPOSTA_PLAUSIVEL}\n{_sentinela(argv)}\nservice degraded, retry later"),
+    )
+    r = backends.invoke(_model("agy"), "oi", workdir=tmp_path)
+    assert r.ok is False
+    assert (r.error or "").startswith(backends.FPCH_ERRO_SENTINELA_AUSENTE)
+    assert "FPCH-FIM" not in r.text
+
+
+def test_sentinela_repetida_no_meio_e_no_fim_cumpre_e_some_toda(tmp_path, monkeypatch):
+    _responde(
+        monkeypatch,
+        lambda argv: (0, f"{RESPOSTA_PLAUSIVEL}\n{_sentinela(argv)}\nmais texto\n{_sentinela(argv)}"),
+    )
+    r = backends.invoke(_model("agy"), "oi", workdir=tmp_path)
+    assert r.ok is True
+    assert "FPCH-FIM" not in r.text
+
+
+@pytest.mark.parametrize(
+    "molde",
+    [
+        "{resp}\r\n{sent}\r\n",
+        "{resp}\r\n{sent}   \r\n\r\n",
+        "{resp}\n   {sent}\t\n\n  \n",
+        "{resp}\n**{sent}**",
+        "{resp}\n`{sent}`",
+    ],
+)
+def test_crlf_espaco_final_e_decoracao_sao_tolerados(tmp_path, monkeypatch, molde):
+    _responde(
+        monkeypatch,
+        lambda argv: (0, molde.format(resp=RESPOSTA_PLAUSIVEL, sent=_sentinela(argv))),
+    )
+    r = backends.invoke(_model("copilot"), "oi", workdir=tmp_path)
+    assert r.ok is True, r.error
+    assert r.text == RESPOSTA_PLAUSIVEL
+
+
+@pytest.mark.parametrize("backend", BACKENDS)
+def test_prompt_encaminhado_cumpre_contrato_com_nonce_do_ponteiro(tmp_path, monkeypatch, backend):
+    longo = "z" * (backends._ARG_LIMIT + 1)
+    chamadas = _responde(monkeypatch, lambda argv: (0, f"{RESPOSTA_PLAUSIVEL}\n{_sentinela(argv)}"))
+    r = backends.invoke(_model(backend), longo, workdir=tmp_path)
+    assert r.ok is True
+    [encaminhado] = tmp_path.glob("fpch-prompt-*.md")
+    assert f"this code: {_nonce(chamadas[0])}" in encaminhado.read_text(encoding="utf-8")
+
+
+def test_lista_de_negacao_ainda_reprova_com_sentinela_presente(tmp_path, monkeypatch):
+    _responde(
+        monkeypatch,
+        lambda argv: (0, f"jetski: no output produced - tool auto-denied\n{_sentinela(argv)}"),
+    )
+    r = backends.invoke(_model("agy"), "oi", workdir=tmp_path)
+    assert r.ok is False
+    assert "falha semântica" in (r.error or "")
+    assert "FPCH-FIM" not in (r.error or "")
+
+
+def test_heuristica_de_resposta_curta_mede_o_texto_sem_sentinela(tmp_path, monkeypatch):
+    _responde(monkeypatch, lambda argv: (0, f"ok\n{_sentinela(argv)}"))
+    r = backends.invoke(_model("agy"), "oi", workdir=tmp_path)
+    assert r.ok is False
+    assert "resposta suspeitamente curta" in (r.error or "")
+
+
+def test_exit_diferente_de_zero_continua_falha_e_sem_sentinela_no_erro(tmp_path, monkeypatch):
+    _responde(monkeypatch, lambda argv: (2, f"boom\n{_sentinela(argv)}"))
+    r = backends.invoke(_model("agy"), "oi", workdir=tmp_path)
+    assert r.ok is False
+    assert r.exit_code == 2
+    assert r.error == "boom"
+
+
+def test_opt_out_e_deliberado_e_registrado(tmp_path, monkeypatch):
+    chamadas = _responde(monkeypatch, lambda argv: (0, RESPOSTA_PLAUSIVEL))
+    r = backends.invoke(_model("agy"), "oi", workdir=tmp_path, output_contract=False)
+    assert r.ok is True
+    assert r.contract == backends.FPCH_CONTRATO_NENHUM
+    # Sem contrato, nada de instrução no prompt: o argv volta ao de antes de C18.
+    assert chamadas[0][:5] == ["agy", "--model", "modelo-de-teste", "-p", "oi"]
+
+
+def test_opt_out_mantem_a_lista_de_negacao(tmp_path, monkeypatch):
+    _responde(monkeypatch, lambda argv: (0, "quota exceeded for this account, try again tomorrow"))
+    r = backends.invoke(_model("agy"), "oi", workdir=tmp_path, output_contract=False)
+    assert r.ok is False
+    assert "falha semântica" in (r.error or "")
+
+
+def test_timeout_registra_o_contrato_exigido(tmp_path, monkeypatch):
+    def estoura(argv):
+        raise subprocess.TimeoutExpired(cmd=argv, timeout=1)
+
+    _responde(monkeypatch, estoura)
+    r = backends.invoke(_model("agy"), "oi", workdir=tmp_path, timeout_s=1)
+    assert r.ok is False
+    assert r.contract == backends.FPCH_CONTRATO_SENTINELA
+
+
+def test_nonce_e_novo_a_cada_chamada(tmp_path, capturado):
+    backends.invoke(_model("agy"), "oi", workdir=tmp_path)
+    backends.invoke(_model("agy"), "oi", workdir=tmp_path)
+    assert _nonce(capturado[0]["argv"]) != _nonce(capturado[1]["argv"])
+
+
+def test_result_montado_a_mao_nao_anuncia_contrato():
+    r = backends.Result(
+        ok=True, text="x", exit_code=0, latency_s=0.0, model="m", backend="b", pool=Pool.LOCAL,
+    )
+    assert r.contract == backends.FPCH_CONTRATO_NENHUM
+
+
+@pytest.mark.parametrize("backend", BACKENDS)
+def test_envelope_estruturado_e_lacuna_declarada(backend):
+    """Nenhum esquema de envelope JSON foi verificável sem invocar modelo.
+
+    `claude`, `copilot` e `agy` documentam `--output-format json` no `--help`,
+    mas nenhum documenta o esquema. Enquanto for assim a capacidade é AUSENTE e
+    `"envelope"` não existe no vocabulário. Quem mudar isto precisa trazer o
+    parser E o teste de `is_error`/JSON malformado junto.
+    """
+    cap = backends.ADAPTERS[backend].regime.saida_estruturada
+    assert cap.suporte is backends.Suporte.AUSENTE
+    assert "--output-format json" in cap.mecanismo
+    assert "envelope" not in backends.FPCH_CONTRATOS
+
+
+def test_so_a_sentinela_exata_desta_chamada_e_removida():
+    """Fronteira de token: 17 hex, letra colada e nonce alheio ficam intactos."""
+    c = backends.FpchContratoSaida(nonce="0123456789abcdef")
+    literal_do_repo = "FPCH-FIM-fedcba9876543210"  # como aparece em teste citado
+    bruto = (
+        f"cita {literal_do_repo} de outro teste\n"
+        f"dezessete hex {c.sentinela}f fica\n"
+        f"colado X{c.sentinela} fica\n"
+        f"no meio ({c.sentinela}) sai\n"
+        f"{c.sentinela}"
+    )
+    texto, cumprido = c.aplicar(bruto)
+    assert cumprido is True
+    assert literal_do_repo in texto
+    assert f"{c.sentinela}f" in texto
+    assert f"X{c.sentinela}" in texto
+    assert "no meio () sai" in texto
+
+
+def test_dezessete_hex_na_ultima_linha_nao_cumpre():
+    c = backends.FpchContratoSaida(nonce="0123456789abcdef")
+    texto, cumprido = c.aplicar(f"{RESPOSTA_PLAUSIVEL}\n{c.sentinela}f")
+    assert cumprido is False
+    assert texto.endswith(f"{c.sentinela}f")
+
+
+def test_sem_contrato_texto_com_formato_de_sentinela_volta_intacto(tmp_path, monkeypatch):
+    bruto = f"{RESPOSTA_PLAUSIVEL}\nFPCH-FIM-0123456789abcdef"
+    _responde(monkeypatch, lambda argv: (0, bruto))
+    r = backends.invoke(_model("agy"), "oi", workdir=tmp_path, output_contract=False)
+    assert r.ok is True
+    assert r.text == bruto
+
+
+# --- diagnóstico da falha de contrato (C11: não achatar causas distintas) ---
+
+
+def test_contrato_falho_com_quota_exceeded_traz_prefixo_e_assinatura(tmp_path, monkeypatch):
+    _responde(monkeypatch, lambda argv: (0, "Error: Quota exceeded for model tier, try again later"))
+    r = backends.invoke(_model("agy"), "oi", workdir=tmp_path)
+    assert r.ok is False
+    assert r.error.startswith(backends.FPCH_ERRO_SENTINELA_AUSENTE)
+    assert "assinatura: 'quota exceeded'" in r.error
+    assert "Quota exceeded for model tier" in r.error
+    assert r.failure_signature == "quota exceeded"
+
+
+def test_contrato_falho_com_frase_desconhecida_traz_prefixo_e_trecho(tmp_path, monkeypatch):
+    frase = "service temporarily degraded, please retry your request in a few minutes"
+    _responde(monkeypatch, lambda argv: (0, frase))
+    r = backends.invoke(_model("agy"), "oi", workdir=tmp_path)
+    assert r.error == f"{backends.FPCH_ERRO_SENTINELA_AUSENTE} — {frase}"
+    assert "assinatura" not in r.error
+    assert r.failure_signature is None
+
+
+def test_trecho_do_erro_e_saneado_e_limitado(tmp_path, monkeypatch):
+    sujo = "linha1\r\n\tlinha2\x1b[31m" + "y" * 500
+    _responde(monkeypatch, lambda argv: (0, sujo))
+    r = backends.invoke(_model("agy"), "oi", workdir=tmp_path)
+    trecho = r.error.split(" — ", 1)[1]
+    assert len(trecho) == 200
+    assert "\n" not in r.error and "\r" not in r.error and "\x1b" not in r.error
+    assert trecho.startswith("linha1 linha2 [31m")
+
+
+def test_contrato_falho_com_saida_vazia_nao_pendura_separador(tmp_path, monkeypatch):
+    _responde(monkeypatch, lambda argv: (0, ""))
+    r = backends.invoke(_model("agy"), "oi", workdir=tmp_path)
+    assert r.error == (
+        f"{backends.FPCH_ERRO_SENTINELA_AUSENTE}; assinatura: 'resposta suspeitamente curta'"
+    )
+
+
+def test_failure_signature_tambem_quando_o_contrato_passa(tmp_path, monkeypatch):
+    _responde(
+        monkeypatch, lambda argv: (0, f"rate limit exceeded on upstream provider\n{_sentinela(argv)}")
+    )
+    r = backends.invoke(_model("agy"), "oi", workdir=tmp_path)
+    assert r.ok is False
+    assert r.failure_signature == "rate limit exceeded"
+
+
+def test_sucesso_nao_tem_failure_signature(tmp_path, capturado):
+    r = backends.invoke(_model("agy"), "oi", workdir=tmp_path)
+    assert r.ok is True and r.failure_signature is None

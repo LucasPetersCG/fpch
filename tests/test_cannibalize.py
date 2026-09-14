@@ -600,3 +600,76 @@ def test_id_no_formato_aparece_como_esta() -> None:
 
     assert "alvo 0a1b2c3d:" in msg
     assert "fpch canib accept 0a1b2c3d" in msg
+
+
+# --- C18: ficha nunca carrega a sentinela do contrato de saída ---------------
+
+
+def test_ficha_ponta_a_ponta_nao_contem_sentinela(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Router e backends REAIS; só o processo externo (`_run`) é falso.
+
+    O duplo responde como um modelo obediente: relatório + sentinela da chamada.
+    A ficha gravada não pode conter sentinela nem a instrução do contrato, e o
+    prompt do estágio de proposta não pode carregar a sentinela da extração.
+    """
+    import re
+
+    from fpch import audit, backends
+
+    monkeypatch.setenv("FPCH_AUDIT_LOG", str(tmp_path / "audit.jsonl"))
+    audit.reset_state()
+    monkeypatch.setattr(backends, "available", lambda _b: True)
+    nonce_re = re.compile(r"this code: ([0-9a-f]{16})")
+    prompts: list[str] = []
+    sentinelas: list[str] = []
+
+    def fake_run(argv, timeout_s, cwd=None):
+        prompt = argv[argv.index("-p") + 1]
+        prompts.append(prompt)
+        [nonce] = set(nonce_re.findall(prompt))
+        sentinela = f"FPCH-FIM-{nonce}"
+        sentinelas.append(sentinela)
+        corpo = (
+            f"## Estágio {len(prompts)}\n"
+            f"O teste cita `{LITERAL_DO_REPO}` e a variante `{sentinela}0` (17 hex).\n"
+            "conteúdo gerado longo o bastante para ser trabalho real"
+        )
+        return 0, f"{corpo}\r\n\r\n**{sentinela}**\r\n"
+
+    monkeypatch.setattr(backends, "_run", fake_run)
+
+    aprovado = _persisted(cannibalize.STATUS_ACCEPTED)
+    path = _run(aprovado, tmp_path)
+    audit.reset_state()
+
+    ficha = path.read_text(encoding="utf-8")
+    assert len(prompts) == 2
+    assert "## Estágio 1" in ficha and "## Estágio 2" in ficha
+    assert "OUTPUT CONTRACT" not in ficha
+    for sentinela in sentinelas:
+        # A sentinela real some; a variante de 17 hex é conteúdo e fica.
+        assert re.search(rf"{sentinela}(?![0-9a-f])", ficha) is None
+        assert f"{sentinela}0" in ficha
+    # Literal com formato de sentinela citado do próprio repositório: preservado.
+    assert ficha.count(LITERAL_DO_REPO) == 2
+    # A extração alimenta a proposta sem levar a sentinela do 1º estágio.
+    assert re.search(rf"{sentinelas[0]}(?![0-9a-f])", prompts[1]) is None
+
+
+LITERAL_DO_REPO = "FPCH-FIM-0123456789abcdef"
+
+
+def test_render_nao_apaga_texto_com_formato_de_sentinela() -> None:
+    """Regra menos destrutiva: `_render` não limpa nada.
+
+    Só `backends.invoke` conhece o nonce, e só ele remove sentinela. Um relatório
+    sobre o próprio FPCH cita `FPCH-FIM-0123456789abcdef` dos testes; apagar isso
+    na ficha a faria mentir sobre a fonte.
+    """
+    texto = f"relatório cita {LITERAL_DO_REPO} e {LITERAL_DO_REPO}0 (17 hex)"
+    conteudo = cannibalize._render(
+        _target(cannibalize.STATUS_ACCEPTED), _fake_result(texto), _fake_result(texto)
+    )
+    assert conteudo.count(f"relatório cita {LITERAL_DO_REPO} e {LITERAL_DO_REPO}0") == 2

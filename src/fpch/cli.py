@@ -286,6 +286,7 @@ def _cmd_ask(args: argparse.Namespace) -> int:
                 "latency_s": result.latency_s,
                 "text": result.text,
                 "error": result.error,
+                "contract": result.contract,
             },
             ensure_ascii=False,
         ))

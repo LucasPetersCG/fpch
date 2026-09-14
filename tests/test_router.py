@@ -11,6 +11,8 @@ nenhum processo externo é iniciado aqui.
 
 from __future__ import annotations
 
+import re
+
 import pytest
 
 from fpch import audit, backends, router
@@ -237,3 +239,133 @@ def test_falha_de_trilha_nao_derruba_o_roteamento(tmp_path, monkeypatch):
 
     assert res.ok is True
     assert audit.counters()["write_failures"] == 3  # start + attempt + end
+
+
+# --------------------------------------------------------------------------
+# Contrato de saída (C18) — com o `backends.invoke` REAL e só `_run` falso
+# --------------------------------------------------------------------------
+
+_NONCE = re.compile(r"this code: ([0-9a-f]{16})")
+
+
+def _sentinela_do_argv(argv: list[str]) -> str:
+    [nonce] = {m.group(1) for tok in argv for m in _NONCE.finditer(tok)}
+    return f"FPCH-FIM-{nonce}"
+
+
+def test_contrato_nao_cumprido_escala_para_o_proximo_modelo(trilha, tmp_path, monkeypatch):
+    """O primeiro modelo devolve exit 0 com erro de redação desconhecida; escala."""
+    saidas = [
+        lambda argv: "service temporarily degraded, please retry your request later",
+        lambda argv: f"resposta real e completa do segundo modelo da cadeia\n{_sentinela_do_argv(argv)}",
+    ]
+    chamadas: list[list[str]] = []
+
+    def fake_run(argv, timeout_s, cwd=None):
+        chamadas.append(argv)
+        return 0, saidas[len(chamadas) - 1](argv)
+
+    monkeypatch.setattr(backends, "_run", fake_run)
+
+    res = router.route(TaskClass.STANDARD, "p", workdir=tmp_path, max_escalations=2)
+
+    assert res.ok is True
+    assert len(chamadas) == 2
+    assert "FPCH-FIM" not in res.text
+    tentativas = [e for e in _eventos(trilha) if e["event"] == "attempt"]
+    assert tentativas[0]["ok"] is False
+    assert tentativas[0]["error"].startswith(backends.FPCH_ERRO_SENTINELA_AUSENTE)
+    assert tentativas[1]["escalated_from"] == tentativas[0]["model"]
+    assert all(t["contract"] == "sentinela" for t in tentativas)
+    # Frase fora da lista de negação: nenhuma assinatura, e o campo é omitido.
+    assert "failure_signature" not in tentativas[0]
+    assert _eventos(trilha)[-1]["outcome"] == "ok"
+    assert audit.verify_chain(trilha) == (True, None)
+
+
+def _run_obediente(chamadas: list[list[str]]):
+    """`_run` falso que cumpre o contrato SE houver nonce no argv, e só então."""
+
+    def fake_run(argv, timeout_s, cwd=None):
+        chamadas.append(argv)
+        corpo = "resposta real e longa o bastante para passar na heurística"
+        if any(_NONCE.search(tok) for tok in argv):
+            return 0, f"{corpo}\n{_sentinela_do_argv(argv)}"
+        return 0, corpo
+
+    return fake_run
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "esperado"),
+    [({}, "sentinela"), ({"output_contract": True}, "sentinela"), ({"output_contract": False}, "nenhum")],
+)
+def test_flag_do_route_vira_contrato_no_invoke_real_e_na_trilha(
+    trilha, tmp_path, monkeypatch, kwargs, esperado
+):
+    """Mapeamento flag → contrato com o `backends.invoke` REAL; só `_run` é falso."""
+    chamadas: list[list[str]] = []
+    monkeypatch.setattr(backends, "_run", _run_obediente(chamadas))
+
+    res = router.route(TaskClass.STANDARD, "p", workdir=tmp_path, **kwargs)
+
+    assert res.ok is True
+    assert res.contract == esperado
+    instrucao_enviada = any("OUTPUT CONTRACT" in tok for tok in chamadas[0])
+    assert instrucao_enviada is (esperado == "sentinela")
+    [tentativa] = [e for e in _eventos(trilha) if e["event"] == "attempt"]
+    assert tentativa["contract"] == esperado
+
+
+@pytest.mark.parametrize(
+    ("flag", "esperado"), [(True, "sentinela"), (False, "nenhum")]
+)
+def test_tentativa_indisponivel_tambem_registra_o_contrato(
+    trilha, tmp_path, monkeypatch, flag, esperado
+):
+    """Sem `contract`, a tentativa recusada pareceria anterior a C18."""
+
+    def recusa(model, prompt, **kw):
+        raise backends.ContainmentUnsupported("contenção não honrada")
+
+    monkeypatch.setattr(backends, "invoke", recusa)
+    with pytest.raises(router.NoBackendAvailable):
+        router.route(
+            TaskClass.STANDARD, "p", workdir=tmp_path, max_escalations=0, output_contract=flag
+        )
+    [tentativa] = [e for e in _eventos(trilha) if e["event"] == "attempt"]
+    assert tentativa["ok"] is False
+    assert tentativa["contract"] == esperado
+
+
+def test_prompt_chars_e_do_chamador_sem_a_instrucao(trilha, tmp_path, monkeypatch):
+    """Escolha documentada: `prompt_chars` exclui a instrução do contrato.
+
+    O enviado de fato é `prompt_chars + FPCH_CONTRATO_INSTRUCAO_CHARS` quando
+    `contract == "sentinela"` — e isto prende as duas metades da afirmação.
+    """
+    chamadas: list[list[str]] = []
+    monkeypatch.setattr(backends, "_run", _run_obediente(chamadas))
+    modelo = BY_ID[MODELO_FIXO]
+    prompt = "q" * 321
+
+    router.route(TaskClass.STANDARD, prompt, workdir=tmp_path, model_id=MODELO_FIXO)
+
+    [tentativa] = [e for e in _eventos(trilha) if e["event"] == "attempt"]
+    assert tentativa["prompt_chars"] == 321
+    argv = chamadas[0]
+    enviado = [tok for tok in argv if tok.startswith(prompt)]
+    assert modelo.backend in argv[0]
+    assert len(enviado) == 1
+    assert len(enviado[0]) == tentativa["prompt_chars"] + backends.FPCH_CONTRATO_INSTRUCAO_CHARS
+
+
+def test_failure_signature_vai_para_a_trilha(trilha, tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        backends, "_run", lambda argv, timeout_s, cwd=None: (0, "quota exceeded for this account today")
+    )
+    router.route(TaskClass.STANDARD, "p", workdir=tmp_path, max_escalations=0)
+    [tentativa] = [e for e in _eventos(trilha) if e["event"] == "attempt"]
+    assert tentativa["failure_signature"] == "quota exceeded"
+    assert tentativa["error"].startswith(backends.FPCH_ERRO_SENTINELA_AUSENTE)
+    assert audit.verify_chain(trilha) == (True, None)

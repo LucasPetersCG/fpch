@@ -111,6 +111,15 @@ MARKS = ("t_err", "t_lock", "t_obs")
 #: chamador e, por definição, não declara campo governante.
 TIMEOUT_ORIGINS = ("policy", "explicit")
 
+#: Contrato de saída exigido numa tentativa (C18). Espelha
+#: `backends.FPCH_CONTRATOS`; fica duplicado aqui para a trilha não importar a
+#: camada de invocação, e um teste prende a igualdade. Campo novo e opcional, sem
+#: subir `SCHEMA_VERSION`: `None` é omitido na serialização, então nenhuma linha
+#: antiga muda de hash, e `attempt` sem `contract` lê-se como "anterior a C18".
+#: Subir o esquema também desligaria `improve._metadados_hook`, que exige
+#: `schema_version == SCHEMA_VERSION` nos eventos `verify` já gravados.
+CONTRACTS = ("sentinela", "nenhum")
+
 #: Campos de vocabulário fechado cuja validação é uma pertinência simples. O
 #: `cause_subtype` fica de fora porque sua validade depende da categoria.
 _CLOSED_VOCAB: dict[str, tuple[str, ...]] = {
@@ -118,6 +127,7 @@ _CLOSED_VOCAB: dict[str, tuple[str, ...]] = {
     "fault_side": FAULT_SIDES,
     "source": SOURCES,
     "mark": MARKS,
+    "contract": CONTRACTS,
 }
 
 
@@ -163,13 +173,20 @@ class Event:
     backend: str | None = None
     model: str | None = None
     pool: str | None = None
-    prompt_chars: int | None = None     # PROXY de tokens de entrada
+    prompt_chars: int | None = None     # PROXY de tokens de entrada; prompt do chamador,
+                                        # sem a instrução do contrato de saída (C18)
     output_chars: int | None = None     # PROXY de tokens de saída
     exit_code: int | None = None
     latency_s: float | None = None
     ok: bool | None = None
     error: str | None = None
     escalated_from: str | None = None
+    contract: str | None = None         # contrato de saída exigido (CONTRACTS), C18
+    # Assinatura da lista de negação que casou (C18). Texto livre, não vocabulário
+    # fechado: a lista existe para crescer e encolher, e linha antiga com
+    # assinatura aposentada não é defeito. Opcional e omitido quando None — mesmo
+    # padrão de `contract`, sem subir o esquema.
+    failure_signature: str | None = None
 
     # verify
     component: str | None = None        # qual hook emitiu o veredito

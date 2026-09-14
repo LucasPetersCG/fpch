@@ -3,7 +3,8 @@
 Política, em uma frase: comece pelo mais barato que plausivelmente resolve;
 escale só diante de falha; nunca gaste cota cara sem ter tentado a barata.
 
-Escalar por FALHA (exit≠0, vazio, timeout) é objetivo e barato de detectar.
+Escalar por FALHA (exit≠0, vazio, timeout, contrato de saída não cumprido) é
+objetivo e barato de detectar.
 Escalar por QUALIDADE ruim exigiria um avaliador — e um avaliador que o próprio
 agente pode influenciar é convite a Goodhart. Por isso o gatilho aqui é só falha:
 juízo de qualidade fica com o humano ou com um hook determinístico externo.
@@ -56,6 +57,7 @@ def route(
     extra_dirs: list[Path] | None = None,
     label: str | None = None,
     trajectory_id: str | None = None,
+    output_contract: bool = True,
 ) -> backends.Result:
     """Roteia o prompt, escalando na cadeia enquanto houver falha.
 
@@ -67,6 +69,10 @@ def route(
     exemplo) amarre dois estágios sucessivos à mesma trajetória. Sem ele, cada
     chamada abre a sua — o que é o correto quando ninguém acima está coordenando,
     e errado quando alguém está: daí o parâmetro em vez de gerar sempre.
+
+    `output_contract` (default ligado) é repassado a `backends.invoke`: contrato
+    de saída não cumprido volta como `ok=False` e escala como qualquer falha.
+    Desligar é opt-out deliberado, e cada `attempt` grava qual contrato valeu.
 
     Toda saída emite `end`. Um roteamento que termina sem registrar como terminou
     é indistinguível, na leitura da trilha, de um processo que morreu no meio.
@@ -112,6 +118,13 @@ def route(
     last: backends.Result | None = None
     previous_model: str | None = None
 
+    # Contrato EXIGIDO, conhecido antes de invocar: vai também na tentativa que
+    # não chega a rodar (backend indisponível, contenção recusada). Sem ele, essa
+    # linha seria lida como anterior a C18.
+    contrato = (
+        backends.FPCH_CONTRATO_SENTINELA if output_contract else backends.FPCH_CONTRATO_NENHUM
+    )
+
     for model in chain:
         attempts += 1
         campos = {
@@ -119,8 +132,12 @@ def route(
             "backend": model.backend,
             "model": model.id,
             "pool": model.pool.value,
+            # Prompt DO CHAMADOR, sem a instrução do contrato: mantém a série
+            # comparável com a trilha anterior a C18. O acréscimo real é constante
+            # (`backends.FPCH_CONTRATO_INSTRUCAO_CHARS`) e dedutível de `contract`.
             "prompt_chars": len(prompt),
             "escalated_from": previous_model,
+            "contract": contrato,
         }
         try:
             result = backends.invoke(
@@ -130,6 +147,7 @@ def route(
                 timeout_s=timeout_s,
                 allow_write=allow_write,
                 extra_dirs=extra_dirs,
+                output_contract=output_contract,
             )
         except backends.BackendUnavailable as exc:
             emit(ok=False, error=str(exc), **campos)
@@ -142,7 +160,9 @@ def route(
             latency_s=result.latency_s,
             output_chars=len(result.text),
             error=result.error,
-            **campos,
+            failure_signature=result.failure_signature,
+            # O `Result` diz qual contrato de fato valeu; prevalece sobre o pedido.
+            **{**campos, "contract": result.contract},
         )
 
         if result.ok:

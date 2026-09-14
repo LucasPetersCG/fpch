@@ -858,3 +858,67 @@ def test_summary_sem_causa_nem_fonte_nao_inventa_baldes(trilha):
     s = audit.summary(trilha)
     assert s["by_cause"] == {}
     assert s["by_source"] == {}
+
+
+# --------------------------------------------------------------------------
+# Contrato de saída (C18) — campo opcional, sem subir o esquema
+# --------------------------------------------------------------------------
+
+def test_vocabulario_de_contrato_espelha_backends():
+    from fpch import backends
+
+    assert audit.CONTRACTS == backends.FPCH_CONTRATOS
+
+
+def test_contrato_fora_do_vocabulario_e_rejeitado_na_construcao():
+    with pytest.raises(ValueError, match="contract"):
+        _evento(0, contract="envelope")
+
+
+def test_attempt_sem_contrato_anterior_a_c18_continua_legivel_e_integro(trilha):
+    """Linha antiga (sem `contract`) e nova (com) convivem na mesma cadeia."""
+    audit.write(_evento(0, model="m", ok=True), trilha)
+    audit.write(_evento(1, model="m", ok=True, contract="sentinela"), trilha)
+
+    antiga, nova = _linhas(trilha)
+    assert "contract" not in antiga
+    assert nova["contract"] == "sentinela"
+    assert antiga["schema_version"] == nova["schema_version"] == audit.SCHEMA_VERSION
+    assert audit.verify_chain(trilha) == (True, None)
+    assert audit.counters()["unknown_vocab"] == 0
+
+
+#: Evento `attempt` anterior a C18, CONGELADO. Construído com `Event` e
+#: `compute_hash` de `git show HEAD:src/fpch/audit.py` (commit 3e2e0b2, esquema
+#: 4), serializado como `write()` grava. Não regenerar: se este literal deixar de
+#: conferir, alguma mudança tornou ilegível a trilha que já existe em disco.
+LINHA_PRE_C18 = (
+    '{"backend":"agy","event":"attempt","exit_code":0,'
+    '"hash":"a76cc2b4bf4cd33508b8d4817370523932ad47140cf7601e1786b7ab8ca87a79",'
+    '"label":"congelada","latency_s":1.5,"model":"Gemini 3.5 Flash (Low)","ok":true,'
+    '"output_chars":87,"pool":"local","prompt_chars":321,"schema_version":4,"seq":1,'
+    '"task_class":"standard","trajectory_id":"pre-c18-congelada",'
+    '"ts":"2026-09-10T10:00:00.000000-03:00"}'
+)
+HASH_PRE_C18 = "a76cc2b4bf4cd33508b8d4817370523932ad47140cf7601e1786b7ab8ca87a79"
+
+
+def test_linha_congelada_pre_c18_confere_e_encadeia_com_evento_novo(trilha):
+    trilha.write_text(LINHA_PRE_C18 + "\n", encoding="utf-8")
+    row = json.loads(LINHA_PRE_C18)
+
+    assert audit.compute_hash(row) == HASH_PRE_C18 == row["hash"]
+    assert audit.verify_chain(trilha) == (True, None)
+
+    # Evento de C18 (com os campos novos) acrescentado depois da linha antiga.
+    assert audit.write(
+        _evento(2, tid="pre-c18-congelada", model="m", ok=False,
+                contract="sentinela", failure_signature="quota exceeded"),
+        trilha,
+    ) is True
+    antiga, nova = _linhas(trilha)
+    assert antiga == row, "a linha antiga não pode ser reescrita"
+    assert nova["prev_hash"] == HASH_PRE_C18
+    assert nova["failure_signature"] == "quota exceeded"
+    assert audit.verify_chain(trilha) == (True, None)
+    assert audit.counters()["unknown_vocab"] == 0

@@ -786,6 +786,13 @@ def run(
 
 def _render(target: Target, extraction, proposal, cite_report=None) -> str:
     today = time.strftime("%d/%m/%Y")
+    # Sem limpeza de sentinela aqui, DE PROPÓSITO (C18). `backends.invoke` já
+    # remove a sentinela da própria chamada — é o único ponto que conhece o
+    # nonce. Apagar "qualquer coisa com formato de sentinela" na ficha seria
+    # destrutivo: ao canibalizar o próprio FPCH, o relatório cita testes que
+    # contêm `FPCH-FIM-0123456789abcdef`, e a ficha passaria a mentir sobre a fonte.
+    extraction_text = extraction.text
+    proposal_text = proposal.text
     if cite_report is not None:
         cite_block = "\n" + citations.render_block(cite_report, Path(target.local_path)) + "\n"
     elif target.local_path:
@@ -829,13 +836,13 @@ def _render(target: Target, extraction, proposal, cite_report=None) -> str:
 
 ## Parte 1 — Relatório factual
 
-{extraction.text}
+{extraction_text}
 
 ---
 
 ## Parte 2 — Proposta de adoção pelo FPCH
 
-{proposal.text}
+{proposal_text}
 
 ---
 
