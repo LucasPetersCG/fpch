@@ -19,7 +19,8 @@ import hashlib
 import json
 import os
 import stat
-from dataclasses import asdict, dataclass
+from collections.abc import Mapping
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import Any, Literal
 
@@ -36,10 +37,20 @@ from .interview import (
     FpchInterviewPreferences,
     loads as load_interview,
 )
-from .mcp import FpchMcpError, FpchMcpInstallCheckpoint, validate as validate_mcp
+from .mcp import (
+    FpchMcpArtifactVerification,
+    FpchMcpError,
+    FpchMcpInstallCheckpoint,
+    read_metadata_json,
+    scan_metadata,
+    validate as validate_mcp,
+    verify_artifact,
+)
 
 FPCH_SETUP_PLAN_SCHEMA_VERSION = 2
 FPCH_SETUP_MANIFEST_SCHEMA_VERSION = 1
+FPCH_SETUP_MANIFEST_MCP_SCHEMA_VERSION = 2
+FPCH_SETUP_MCP_EVIDENCE_SCHEMA_VERSION = 1
 # Compatibilidade para consumidores que usavam a constante do wire plan.
 FPCH_SETUP_SCHEMA_VERSION = FPCH_SETUP_PLAN_SCHEMA_VERSION
 FPCH_SETUP_MAX_BYTES = 1024 * 1024
@@ -50,11 +61,18 @@ _ARTIFACT_PATHS = (
     "CLAUDE.md",
     ".fpch/setup-manifest.json",
 )
+_MANIFEST_PATH = ".fpch/setup-manifest.json"
+# Evidência de verificação MCP: artefato de runtime, fora do plano e do plan_id.
+_EVIDENCE_PATH = ".fpch/mcp-verification.json"
+_CONTROLLED_PATHS = _ARTIFACT_PATHS + (_EVIDENCE_PATH,)
 _MEDIA_TYPES = {
     "AGENTS.md": "text/markdown",
     "CLAUDE.md": "text/markdown",
     ".fpch/setup-manifest.json": "application/json",
+    _EVIDENCE_PATH: "application/json",
 }
+_AUDIT_LABEL = "fpch setup apply"
+_AUDIT_LABEL_MCP = "fpch setup apply (MCP verificado, não instalado)"
 _STATES = frozenset(("create", "unchanged", "conflict"))
 _CONFLICT_REASONS = frozenset(
     (
@@ -139,6 +157,20 @@ class FpchSetupResult:
     unchanged: tuple[str, ...]
     conflict: tuple[str, ...]
     audit_written: bool
+    mcp_verified: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class FpchMcpApplyEvidence:
+    """Caminhos locais que sustentam um checkpoint MCP durante ``apply``.
+
+    ``artifact`` é conferido contra o checkpoint (SHA-256 e nome) e ``metadata``
+    é varrido em busca de Unicode oculto. Nenhum dos dois é instalado,
+    extraído ou executado, e nenhum caminho entra no ``plan_id``.
+    """
+
+    artifact: str | Path
+    metadata: str | Path
 
 
 def _canonical_json(value: object, *, newline: bool = False) -> str:
@@ -237,7 +269,7 @@ def _assert_root_identity(root: Path, expected: FpchRepoIdentity) -> None:
 
 
 def _target(root: Path, relative: str) -> Path:
-    if relative not in _ARTIFACT_PATHS:
+    if relative not in _CONTROLLED_PATHS:
         raise FpchSetupError(f"artefato fora da lista permitida: {relative!r}")
     parts = relative.split("/")
     if any(part in ("", ".", "..") for part in parts):
@@ -386,8 +418,9 @@ def _manifest_content(
     discovery_sha256: str,
     interview_sha256: str,
     managed: tuple[FpchPlannedArtifact, ...],
+    checkpoints: tuple[FpchMcpInstallCheckpoint, ...] = (),
 ) -> str:
-    payload = {
+    payload: dict[str, object] = {
         "discovery_sha256": discovery_sha256,
         "generator": "fpch",
         "interview_sha256": interview_sha256,
@@ -401,6 +434,17 @@ def _manifest_content(
         ],
         "schema_version": FPCH_SETUP_MANIFEST_SCHEMA_VERSION,
     }
+    if checkpoints:
+        # Sem checkpoints o manifesto continua byte a byte idêntico ao v1.
+        payload["mcp"] = {
+            "checkpoints": [
+                _mcp_checkpoint_dict(item)
+                for item in sorted(checkpoints, key=lambda item: item.name)
+            ],
+            "evidence_path": _EVIDENCE_PATH,
+            "installed": False,
+        }
+        payload["schema_version"] = FPCH_SETUP_MANIFEST_MCP_SCHEMA_VERSION
     return _canonical_json(payload, newline=True)
 
 
@@ -481,6 +525,7 @@ def _desired_artifacts(
     preferences: FpchInterviewPreferences,
     discovery_sha256: str,
     interview_sha256: str,
+    checkpoints: tuple[FpchMcpInstallCheckpoint, ...] = (),
 ) -> tuple[FpchPlannedArtifact, ...]:
     agents = _artifact(
         "AGENTS.md",
@@ -494,7 +539,9 @@ def _desired_artifacts(
     claude = _artifact("CLAUDE.md", _claude_content())
     manifest = _artifact(
         ".fpch/setup-manifest.json",
-        _manifest_content(discovery_sha256, interview_sha256, (agents, claude)),
+        _manifest_content(
+            discovery_sha256, interview_sha256, (agents, claude), checkpoints
+        ),
     )
     return agents, claude, manifest
 
@@ -565,6 +612,30 @@ def _computed_plan_id(value: FpchSetupPlan) -> str:
     return _sha256_text(_canonical_json(_logical_plan_dict(value)))
 
 
+def _plan_id_matches(value: FpchSetupPlan) -> bool:
+    """Compara o plan_id sem deixar tipos malformados escaparem como outro erro."""
+    try:
+        return _is_sha256(value.plan_id) and value.plan_id == _computed_plan_id(value)
+    except Exception:
+        return False
+
+
+def _validate_plan_checkpoints(value: FpchSetupPlan) -> None:
+    if type(value.mcp_install_checkpoints) is not tuple:
+        raise FpchSetupError("mcp_install_checkpoints deve ser tupla")
+    checkpoint_names: list[str] = []
+    for checkpoint in value.mcp_install_checkpoints:
+        try:
+            validate_mcp(checkpoint)
+        except FpchMcpError as exc:
+            raise FpchSetupError("checkpoint MCP inválido no plano") from exc
+        checkpoint_names.append(checkpoint.name)
+    if checkpoint_names != sorted(checkpoint_names):
+        raise FpchSetupError("checkpoints MCP devem estar ordenados por name")
+    if len(checkpoint_names) != len(set(checkpoint_names)):
+        raise FpchSetupError("names de checkpoint MCP devem ser únicos")
+
+
 def _validate_plan(value: FpchSetupPlan) -> None:
     if not isinstance(value, FpchSetupPlan):
         raise FpchSetupError("plan deve ser FpchSetupPlan")
@@ -597,12 +668,22 @@ def _validate_plan(value: FpchSetupPlan) -> None:
         raise FpchSetupError("artefato inválido no plano")
     if tuple(item.path for item in value.artifacts) != _ARTIFACT_PATHS:
         raise FpchSetupError("conjunto ou ordem de artefatos inválido no plano")
+    # Plano com checkpoints: validados antes da regeneração, pois o manifesto v2
+    # os contém. Sem checkpoints, preserva-se a ordem original de validação
+    # (artefato divergente é reportado antes de checkpoints e plan_id).
+    has_checkpoints = (
+        type(value.mcp_install_checkpoints) is tuple
+        and len(value.mcp_install_checkpoints) > 0
+    )
+    if has_checkpoints:
+        _validate_plan_checkpoints(value)
 
     desired = _desired_artifacts(
         report,
         preferences,
         value.discovery_sha256,
         value.interview_sha256,
+        value.mcp_install_checkpoints if has_checkpoints else (),
     )
     conflict_by_path: dict[str, FpchSetupConflict] = {}
     for artifact, regenerated in zip(value.artifacts, desired, strict=True):
@@ -617,6 +698,21 @@ def _validate_plan(value: FpchSetupPlan) -> None:
             or artifact.sha256 != regenerated.sha256
             or artifact.media_type != regenerated.media_type
         ):
+            # Manifesto depende dos checkpoints: checkpoint trocado sem recalcular
+            # o plan_id continua sendo reportado como plan_id divergente.
+            if has_checkpoints and not _plan_id_matches(value):
+                raise FpchSetupError("plan_id não corresponde ao conteúdo do plano")
+            if has_checkpoints and artifact.path == _MANIFEST_PATH:
+                legacy = _desired_artifacts(
+                    report,
+                    preferences,
+                    value.discovery_sha256,
+                    value.interview_sha256,
+                )[-1]
+                if artifact.content == legacy.content:
+                    raise FpchSetupError(
+                        "plano MCP de versão anterior; gere novo plano"
+                    )
             raise FpchSetupError(f"artefato não deriva dos snapshots: {artifact.path}")
         if type(artifact.state) is not str or artifact.state not in _STATES:
             raise FpchSetupError(f"estado inválido para {artifact.path}")
@@ -641,19 +737,8 @@ def _validate_plan(value: FpchSetupPlan) -> None:
     }
     if state_conflicts != set(conflict_by_path):
         raise FpchSetupError("estados conflict não correspondem à lista de conflitos")
-    if type(value.mcp_install_checkpoints) is not tuple:
-        raise FpchSetupError("mcp_install_checkpoints deve ser tupla")
-    checkpoint_names: list[str] = []
-    for checkpoint in value.mcp_install_checkpoints:
-        try:
-            validate_mcp(checkpoint)
-        except FpchMcpError as exc:
-            raise FpchSetupError("checkpoint MCP inválido no plano") from exc
-        checkpoint_names.append(checkpoint.name)
-    if checkpoint_names != sorted(checkpoint_names):
-        raise FpchSetupError("checkpoints MCP devem estar ordenados por name")
-    if len(checkpoint_names) != len(set(checkpoint_names)):
-        raise FpchSetupError("names de checkpoint MCP devem ser únicos")
+    if not has_checkpoints:
+        _validate_plan_checkpoints(value)
     if type(value.unresolved_mcps) is not tuple or value.unresolved_mcps:
         raise FpchSetupError("unresolved_mcps deve permanecer vazio")
     if not _is_sha256(value.plan_id) or value.plan_id != _computed_plan_id(value):
@@ -694,6 +779,7 @@ def plan(
         preferences,
         discovery_sha256,
         interview_sha256,
+        tuple(checkpoints),
     )
 
     observed: list[FpchPlannedArtifact] = []
@@ -1272,7 +1358,7 @@ def _validate_journal(
     planned: dict[str, str] = {}
     for raw_item in value["planned"]:
         item = _exact_keys(raw_item, {"path", "sha256"}, "planned do journal")
-        if item["path"] not in _ARTIFACT_PATHS or not _is_sha256(item["sha256"]):
+        if item["path"] not in _CONTROLLED_PATHS or not _is_sha256(item["sha256"]):
             raise FpchSetupError("artefato planejado inválido no journal")
         if item["path"] in planned:
             raise FpchSetupError("artefato duplicado no journal")
@@ -1394,12 +1480,14 @@ def _recover_existing_journal(root: Path, directory: Path) -> None:
 
 
 def _current_states(
-    root: Path, value: FpchSetupPlan
+    root: Path,
+    value: FpchSetupPlan,
+    artifacts: tuple[FpchPlannedArtifact, ...] | None = None,
 ) -> tuple[tuple[str, ...], tuple[str, ...], tuple[str, ...]]:
     created: list[str] = []
     unchanged: list[str] = []
     conflicts: list[str] = []
-    for artifact in value.artifacts:
+    for artifact in value.artifacts if artifacts is None else artifacts:
         state, _conflict = _artifact_state(root, artifact)
         if state != artifact.state:
             raise FpchSetupError(
@@ -1456,10 +1544,11 @@ def _verify_installed(
     root: Path,
     value: FpchSetupPlan,
     created: list[tuple[FpchPlannedArtifact, Path, os.stat_result]],
+    artifacts: tuple[FpchPlannedArtifact, ...] | None = None,
 ) -> None:
     _assert_discovery_current(root, value)
     created_by_path = {artifact.path: metadata for artifact, _path, metadata in created}
-    for artifact in value.artifacts:
+    for artifact in value.artifacts if artifacts is None else artifacts:
         state, _conflict = _artifact_state(root, artifact)
         if state != "unchanged":
             raise FpchSetupError(f"artefato sofreu drift após criação: {artifact.path}")
@@ -1471,10 +1560,302 @@ def _verify_installed(
                 )
 
 
+_FpchMcpObservation = tuple[tuple[FpchMcpArtifactVerification, Any], ...]
+
+
+def _is_inside(candidate: str, directory: str) -> bool:
+    if candidate == directory:
+        return True
+    prefix = directory if directory.endswith(os.sep) else directory + os.sep
+    return candidate.startswith(prefix)
+
+
+def _real_normcase(path: str | Path) -> str:
+    """``realpath`` normalizado; componentes ausentes resolvem pelo ancestral existente.
+
+    Remove prefixos como ``\\\\?\\`` no Windows e segue links/junções dos
+    componentes existentes, o que a comparação só lexical não faz. O
+    ``realpath`` do Windows preserva o prefixo quando o caminho não existe, por
+    isso sobe até o ancestral mais próximo que existe e reanexa o restante.
+    """
+    current = os.fspath(path)
+    if os.name == "nt":
+        # ``realpath`` preserva o prefixo quando ele já vem na entrada.
+        for prefix in ("\\\\?\\", "\\\\.\\", "\\??\\"):
+            if current.startswith(prefix):
+                current = current[len(prefix) :]
+                if current[:4].upper() == "UNC\\":
+                    current = "\\\\" + current[4:]
+                break
+    current = os.path.abspath(current)
+    tail: list[str] = []
+    while not os.path.lexists(current):
+        parent, name = os.path.split(current)
+        if not name or parent == current:
+            break
+        tail.append(name)
+        current = parent
+    resolved = os.path.join(os.path.realpath(current), *reversed(tail))
+    return os.path.normcase(os.path.normpath(resolved))
+
+
+def _mcp_evidence_map(
+    value: FpchSetupPlan, raw: object
+) -> dict[str, FpchMcpApplyEvidence]:
+    """Valida forma e cobertura da evidência MCP, sem nenhum I/O de arquivo."""
+    if raw is None:
+        evidence: dict[object, object] = {}
+    elif isinstance(raw, Mapping):
+        try:
+            evidence = dict(raw)
+        except Exception as exc:
+            raise FpchSetupError("evidência MCP inválida") from exc
+    else:
+        raise FpchSetupError("evidência MCP inválida")
+
+    names = [checkpoint.name for checkpoint in value.mcp_install_checkpoints]
+    if not names:
+        if evidence:
+            raise FpchSetupError("plano sem checkpoint MCP não aceita evidência MCP")
+        return {}
+    if not evidence:
+        raise FpchSetupError(
+            "plano contém checkpoint MCP; aplicação permanece bloqueada sem "
+            "evidência de verificação para: " + ", ".join(names)
+        )
+    if not all(type(key) is str for key in evidence):
+        raise FpchSetupError("evidência MCP inválida")
+    expected = set(names)
+    if any(key not in expected for key in evidence):
+        # Nunca ecoa o name desconhecido: pode ser texto arbitrário do chamador.
+        raise FpchSetupError("evidência MCP informada para name fora do plano")
+    missing = [name for name in names if name not in evidence]
+    if missing:
+        raise FpchSetupError("evidência MCP ausente para: " + ", ".join(missing))
+
+    try:
+        control_path = os.path.join(value.repo, ".fpch")
+        control = os.path.normcase(os.path.abspath(control_path))
+        real_control = _real_normcase(control_path)
+    except (OSError, TypeError, ValueError) as exc:
+        raise FpchSetupError("repo inválido no plano") from exc
+    result: dict[str, FpchMcpApplyEvidence] = {}
+    for name in names:
+        item = evidence[name]
+        if type(item) is not FpchMcpApplyEvidence:
+            raise FpchSetupError("evidência MCP inválida")
+        for field_value in (item.artifact, item.metadata):
+            if not (
+                isinstance(field_value, Path)
+                or (type(field_value) is str and field_value)
+            ):
+                raise FpchSetupError("evidência MCP inválida")
+            try:
+                candidate = os.path.normcase(os.path.abspath(field_value))
+                real_candidate = _real_normcase(field_value)
+            except (OSError, TypeError, ValueError) as exc:
+                raise FpchSetupError("evidência MCP inválida") from exc
+            # Lexical e físico: ``\\?\``, links e junções não escapam da checagem.
+            if _is_inside(candidate, control) or _is_inside(real_candidate, real_control):
+                raise FpchSetupError(
+                    f"evidência MCP não pode estar dentro de .fpch: {name}"
+                )
+        result[name] = item
+    return result
+
+
+def _observe_mcp(
+    value: FpchSetupPlan, evidence: Mapping[str, FpchMcpApplyEvidence]
+) -> _FpchMcpObservation:
+    """Verifica artefato e varre metadados de cada checkpoint, ordenado por name."""
+    observations: list[tuple[FpchMcpArtifactVerification, Any]] = []
+    for checkpoint in sorted(value.mcp_install_checkpoints, key=lambda item: item.name):
+        name = checkpoint.name
+        item = evidence[name]
+        try:
+            verification = verify_artifact(checkpoint, item.artifact)
+        except FpchMcpError as exc:
+            raise FpchSetupError(
+                f"evidência MCP insegura ou ilegível para {name}: {exc}"
+            ) from exc
+        if verification.verified is not True:
+            digest = "confere" if verification.digest_matches is True else "diverge"
+            basename = "confere" if verification.basename_matches is True else "diverge"
+            raise FpchSetupError(
+                f"artefato MCP não verificado: {name} "
+                f"(digest {digest}, nome {basename})"
+            )
+        try:
+            # JSON obrigatório: o modo texto não é gramática confiável para gate.
+            scan = scan_metadata(item.metadata, format="json")
+        except FpchMcpError as exc:
+            raise FpchSetupError(
+                f"evidência MCP insegura ou ilegível para {name}: {exc}"
+            ) from exc
+        if (
+            type(scan.size_bytes) is not int
+            or type(scan.findings_total) is not int
+            or type(scan.clean) is not bool
+        ):
+            raise FpchSetupError(
+                f"evidência MCP insegura ou ilegível para {name}: "
+                "varredura de metadados inconsistente"
+            )
+        if scan.size_bytes == 0:
+            raise FpchSetupError(f"metadados MCP vazios: {name}")
+        if scan.clean is not True or scan.findings_total != 0:
+            raise FpchSetupError(
+                f"metadados MCP com Unicode oculto: {name} "
+                f"({scan.findings_total} achado(s)); rode fpch mcp scan"
+            )
+        try:
+            root_sha256, root = read_metadata_json(item.metadata)
+        except FpchMcpError as exc:
+            raise FpchSetupError(
+                f"evidência MCP insegura ou ilegível para {name}: {exc}"
+            ) from exc
+        if root_sha256 != scan.sha256:
+            raise FpchSetupError(f"evidência MCP mudou durante a aplicação: {name}")
+        if not isinstance(root, (dict, list)) or not root:
+            raise FpchSetupError(f"metadados MCP sem conteúdo: {name}")
+        observations.append((verification, scan))
+    return tuple(observations)
+
+
+def _assert_mcp_unchanged(
+    value: FpchSetupPlan,
+    before: _FpchMcpObservation,
+    after: _FpchMcpObservation,
+) -> None:
+    names = sorted(checkpoint.name for checkpoint in value.mcp_install_checkpoints)
+    if len(before) != len(names) or len(after) != len(names):
+        raise FpchSetupError("evidência MCP mudou durante a aplicação")
+    for name, first, second in zip(names, before, after, strict=True):
+        if (
+            first[0].to_dict() != second[0].to_dict()
+            or first[1].to_dict() != second[1].to_dict()
+        ):
+            raise FpchSetupError(f"evidência MCP mudou durante a aplicação: {name}")
+
+
+def _evidence_content(value: FpchSetupPlan, observed: _FpchMcpObservation) -> str:
+    """JSON canônico ASCII, sem caminhos absolutos nem nomes de metadados."""
+    names = sorted(checkpoint.name for checkpoint in value.mcp_install_checkpoints)
+    payload = {
+        "generator": "fpch",
+        "installed": False,
+        "plan_id": value.plan_id,
+        "schema_version": FPCH_SETUP_MCP_EVIDENCE_SCHEMA_VERSION,
+        "verifications": [
+            {
+                "artifact": verification.to_dict(),
+                "metadata": {
+                    "clean": scan.clean,
+                    "findings_total": scan.findings_total,
+                    "format": scan.format,
+                    "leading_bom": scan.leading_bom,
+                    "ruleset": scan.ruleset,
+                    "sha256": scan.sha256,
+                    "size_bytes": scan.size_bytes,
+                    "unicode_version": scan.unicode_version,
+                },
+                "name": name,
+            }
+            for name, (verification, scan) in zip(names, observed, strict=True)
+        ],
+    }
+    try:
+        encoded = (
+            json.dumps(
+                payload, ensure_ascii=True, sort_keys=True, separators=(",", ":")
+            )
+            + "\n"
+        )
+    except (TypeError, ValueError) as exc:
+        raise FpchSetupError("evidência MCP não serializável") from exc
+    if len(encoded.encode("ascii")) > FPCH_SETUP_EXISTING_MAX_BYTES:
+        raise FpchSetupError("evidência MCP excede limite")
+    return encoded
+
+
+def _adopt_existing_evidence(
+    root: Path, desired: FpchPlannedArtifact, actual_sha256: str | None
+) -> FpchPlannedArtifact | None:
+    """Reconhece evidência já gravada por um plano anterior do mesmo estado.
+
+    O ``plan_id`` inclui os estados observados dos artefatos, então o replanejamento
+    após um apply bem-sucedido tem outro ``plan_id``. A evidência existente é
+    ``unchanged`` somente se for JSON canônico de schema 1 idêntico ao desejado
+    exceto pelo ``plan_id``, que continua registrando o plano que a criou. Os bytes
+    adotados passam a ser o artefato revalidado sob lock.
+
+    Limite declarado: qualquer ``plan_id`` com formato SHA-256 é aceito aqui; não
+    se prova que ele nomeia de fato o plano que gravou a evidência.
+    """
+    if not _is_sha256(actual_sha256):
+        return None
+    existing = _read_control_json(_target(root, _EVIDENCE_PATH))
+    expected = json.loads(desired.content)
+    if set(existing) != set(expected) or not _is_sha256(existing.get("plan_id")):
+        return None
+
+    def encode(payload: dict[str, Any]) -> str:
+        return (
+            json.dumps(payload, ensure_ascii=True, sort_keys=True, separators=(",", ":"))
+            + "\n"
+        )
+
+    # Comparação textual canônica: igualdade de dict confundiria 0 com False.
+    try:
+        if encode({**existing, "plan_id": expected["plan_id"]}) != desired.content:
+            return None
+        content = encode(existing)
+    except (TypeError, ValueError):
+        return None
+    adopted = _artifact(_EVIDENCE_PATH, content, state="unchanged")
+    if adopted.sha256 != actual_sha256:
+        return None
+    return adopted
+
+
+def _evidence_artifact(
+    root: Path, value: FpchSetupPlan, observed: _FpchMcpObservation
+) -> FpchPlannedArtifact:
+    """Planeja ``.fpch/mcp-verification.json`` e observa seu estado antes do lock."""
+    desired = _artifact(_EVIDENCE_PATH, _evidence_content(value, observed))
+    state, conflict = _artifact_state(root, desired)
+    manifest_state = value.artifacts[-1].state
+    if (
+        state == "conflict"
+        and manifest_state == "unchanged"
+        and conflict is not None
+        and conflict.reason == "existing_content_differs"
+    ):
+        adopted = _adopt_existing_evidence(root, desired, conflict.actual_sha256)
+        if adopted is not None:
+            return adopted
+    pending_journal = _lstat(root / ".fpch" / _JOURNAL_NAME) is not None
+    if state != "create" and manifest_state == "create" and pending_journal:
+        # Transação interrompida pode ter deixado a evidência; o recovery sob lock
+        # decide, e ``_current_states`` revalida o estado depois dele.
+        state = "create"
+    elif state == "conflict":
+        if conflict is not None and conflict.reason == "existing_content_differs":
+            raise FpchSetupError(f"evidência MCP existente diverge: {_EVIDENCE_PATH}")
+        raise FpchSetupError(f"evidência MCP existente é insegura: {_EVIDENCE_PATH}")
+    elif state == "unchanged" and manifest_state == "create":
+        raise FpchSetupError(
+            f"evidência MCP existente sem manifesto correspondente: {_EVIDENCE_PATH}"
+        )
+    return replace(desired, state=state)
+
+
 def apply(
     value: FpchSetupPlan,
     confirmation: str,
     trilha: str | Path | None = None,
+    *,
+    mcp_evidence: Mapping[str, FpchMcpApplyEvidence] | None = None,
 ) -> FpchSetupResult:
     """Aplica um plano create-only após confirmação literal do ``plan_id``.
 
@@ -1482,14 +1863,28 @@ def apply(
     auditoria, somente arquivos ainda idênticos aos criados nesta transação são
     removidos, em ordem LIFO. Falha ao gravar o evento ``install`` também provoca
     rollback e torna a operação um erro explícito.
+
+    Plano com checkpoint MCP exige ``mcp_evidence`` para cada checkpoint:
+    artefato verificado e metadados JSON (objeto ou lista não vazios, qualquer
+    sufixo) sem Unicode oculto, observados antes do lock e novamente antes da
+    auditoria. O resultado é gravado em ``.fpch/mcp-verification.json``. Nada é
+    instalado, extraído ou executado.
+
+    Limites declarados:
+
+    - A evidência registra ``unicode_version`` e ``ruleset`` da varredura; após
+      atualizar o Python (ou as regras), reaplicar falha com "evidência MCP
+      existente diverge" e exige novo plano e remoção manual do arquivo.
+    - Evidência existente adotada como ``unchanged`` aceita qualquer ``plan_id``
+      bem formado: a procedência desse campo específico não é comprovada.
+    - Os metadados não têm vínculo criptográfico com o artefato; o gate prova só
+      que o arquivo informado estava limpo, não que descreve aquele artefato.
     """
     _validate_plan(value)
-    if value.mcp_install_checkpoints:
-        raise FpchSetupError(
-            "plano contém checkpoint MCP; instalação permanece bloqueada"
-        )
     if type(confirmation) is not str or confirmation != value.plan_id:
         raise FpchSetupError("confirmação deve ser exatamente o plan_id")
+    evidence = _mcp_evidence_map(value, mcp_evidence)
+    checkpoints = value.mcp_install_checkpoints
     root = _validated_root(value.repo)
     _assert_discovery_current(root, value)
 
@@ -1506,6 +1901,15 @@ def apply(
             audit_written=False,
         )
 
+    # Verificação antes de qualquer lock, diretório ou journal.
+    observed: _FpchMcpObservation = (
+        _observe_mcp(value, evidence) if checkpoints else ()
+    )
+    artifacts = value.artifacts
+    if checkpoints:
+        artifacts = (*value.artifacts, _evidence_artifact(root, value, observed))
+    mcp_verified = tuple(checkpoint.name for checkpoint in checkpoints)
+
     directory: Path | None = None
     directory_created: os.stat_result | None = None
     lock_path: Path | None = None
@@ -1520,7 +1924,9 @@ def apply(
         lock_path, lock_created = _acquire_lock(directory, value.plan_id)
         _recover_existing_journal(root, directory)
         _assert_discovery_current(root, value)
-        create_paths, unchanged_paths, conflict_paths = _current_states(root, value)
+        create_paths, unchanged_paths, conflict_paths = _current_states(
+            root, value, artifacts
+        )
         if conflict_paths:
             raise FpchSetupError("plano contém conflito não declarado")
 
@@ -1538,7 +1944,7 @@ def apply(
             journal_payload = _journal_payload(
                 value,
                 state="prepared",
-                planned=value.artifacts,
+                planned=artifacts,
                 created=[],
                 in_progress=None,
                 created_dirs=created_dirs,
@@ -1547,7 +1953,7 @@ def apply(
                 directory, journal_payload
             )
 
-        for artifact in value.artifacts:
+        for artifact in artifacts:
             if artifact.path not in create_paths:
                 continue
             target = _target(root, artifact.path)
@@ -1569,9 +1975,14 @@ def apply(
             journal_payload["in_progress"] = None
             _update_journal(journal_descriptor, journal_payload)
 
+        if checkpoints:
+            # Segunda observação sob lock, também no ramo no-op: evidência trocada
+            # depois da primeira leitura aborta com rollback e sem auditoria.
+            _assert_mcp_unchanged(value, observed, _observe_mcp(value, evidence))
+
         audit_written = False
         if created:
-            _verify_installed(root, value, created)
+            _verify_installed(root, value, created, artifacts)
             if journal_payload is None or journal_descriptor is None:
                 raise FpchSetupError("journal desapareceu antes da auditoria")
             journal_payload["state"] = "auditing"
@@ -1582,7 +1993,7 @@ def apply(
                         event="install",
                         trajectory_id=value.plan_id,
                         seq=0,
-                        label="fpch setup apply",
+                        label=_AUDIT_LABEL_MCP if checkpoints else _AUDIT_LABEL,
                         source="nlah",
                         source_ref=value.plan_id,
                         inverse=_inverse(value, created, directory_created),
@@ -1595,7 +2006,7 @@ def apply(
                 ) from exc
             if not audit_written:
                 raise FpchSetupError("falha ao gravar auditoria de instalação")
-            _verify_installed(root, value, created)
+            _verify_installed(root, value, created, artifacts)
             journal_payload["state"] = "committed"
             _update_journal(journal_descriptor, journal_payload)
             os.close(journal_descriptor)
@@ -1616,6 +2027,7 @@ def apply(
             unchanged=unchanged_paths,
             conflict=(),
             audit_written=audit_written,
+            mcp_verified=mcp_verified,
         )
     except Exception as exc:
         rollback_failures: tuple[str, ...] = ()

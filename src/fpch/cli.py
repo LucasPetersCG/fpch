@@ -110,6 +110,28 @@ def _ascii_escape(text: str) -> str:
     return "".join(result)
 
 
+def _parse_mcp_flags(items: object, flag: str) -> dict[str, str]:
+    """Analisa repetições de ``NAME=PATH``, dividindo no primeiro ``=``.
+
+    Nome vazio, caminho vazio ou nome repetido levantam ``ValueError`` com a
+    mensagem já pronta para `stderr` (nomes sempre escapados)."""
+    result: dict[str, str] = {}
+    for raw in items or ():
+        name, _sep, path = raw.partition("=")
+        if not name:
+            raise ValueError(f"erro de uso: {flag} com NAME vazio")
+        if not path:
+            raise ValueError(
+                f"erro de uso: {flag} com PATH vazio para {_ascii_escape(name)}"
+            )
+        if name in result:
+            raise ValueError(
+                f"erro de uso: {flag} repetido para {_ascii_escape(name)}"
+            )
+        result[name] = path
+    return result
+
+
 def _is_linklike(path: Path) -> bool:
     """Reconhece links, junctions e outros reparse points sem segui-los."""
     try:
@@ -588,12 +610,71 @@ def _cmd_setup_apply(args: argparse.Namespace) -> int:
         )
         return EXIT_USO
 
+    checkpoints = getattr(setup_plan, "mcp_install_checkpoints", ())
+    checkpoint_names = tuple(item.name for item in checkpoints)
+
     try:
-        result = setup.apply(
-            setup_plan,
-            confirmation=args.confirm,
-            trilha=Path(args.trilha) if args.trilha is not None else None,
+        artifact_map = _parse_mcp_flags(getattr(args, "mcp_artifact", None), "--mcp-artifact")
+        metadata_map = _parse_mcp_flags(getattr(args, "mcp_metadata", None), "--mcp-metadata")
+    except ValueError as exc:
+        print(str(exc), file=sys.stderr)
+        return EXIT_USO
+
+    has_mcp_flags = bool(artifact_map or metadata_map)
+    mcp_evidence: dict[str, setup.FpchMcpApplyEvidence] | None = None
+
+    if not checkpoint_names:
+        if has_mcp_flags:
+            print(
+                "erro de uso: --mcp-artifact/--mcp-metadata exigem um plano com "
+                "checkpoints MCP",
+                file=sys.stderr,
+            )
+            return EXIT_USO
+    elif has_mcp_flags:
+        expected = set(checkpoint_names)
+        provided = set(artifact_map) | set(metadata_map)
+        unknown = sorted(provided - expected)
+        missing = sorted(
+            name
+            for name in expected
+            if name not in artifact_map or name not in metadata_map
         )
+        if unknown:
+            print(
+                "erro de uso: desconhecidos: "
+                + ", ".join(_ascii_escape(name) for name in unknown),
+                file=sys.stderr,
+            )
+            return EXIT_USO
+        if missing:
+            print(
+                "erro de uso: faltam: "
+                + ", ".join(_ascii_escape(name) for name in missing),
+                file=sys.stderr,
+            )
+            return EXIT_USO
+        mcp_evidence = {
+            name: setup.FpchMcpApplyEvidence(
+                Path(artifact_map[name]), Path(metadata_map[name])
+            )
+            for name in checkpoint_names
+        }
+
+    try:
+        if mcp_evidence is None:
+            result = setup.apply(
+                setup_plan,
+                confirmation=args.confirm,
+                trilha=Path(args.trilha) if args.trilha is not None else None,
+            )
+        else:
+            result = setup.apply(
+                setup_plan,
+                confirmation=args.confirm,
+                trilha=Path(args.trilha) if args.trilha is not None else None,
+                mcp_evidence=mcp_evidence,
+            )
     except setup.FpchSetupError as exc:
         print(f"erro ao aplicar plano: {_safe_cli_error(exc)}", file=sys.stderr)
         return 1
@@ -607,6 +688,13 @@ def _cmd_setup_apply(args: argparse.Namespace) -> int:
     print(f"criados: {len(result.created)}")
     print(f"inalterados: {len(result.unchanged)}")
     print(f"auditoria registrada: {'sim' if result.audit_written else 'não'}")
+    mcp_verified = getattr(result, "mcp_verified", ())
+    if mcp_verified:
+        print(
+            "MCP verificados (não instalados): "
+            + ", ".join(_ascii_escape(name) for name in mcp_verified)
+        )
+        print("nenhum MCP foi instalado ou executado")
     return 0
 
 
@@ -1128,6 +1216,26 @@ def build_parser() -> argparse.ArgumentParser:
         "--trilha",
         metavar="CAMINHO",
         help="trilha de auditoria a usar nesta aplicação",
+    )
+    suap.add_argument(
+        "--mcp-artifact",
+        metavar="NAME=PATH",
+        action="append",
+        help=(
+            "artefato local (NAME=PATH) para verificar o checkpoint MCP NAME "
+            "do plano; repetível, exigido para cada checkpoint junto de "
+            "--mcp-metadata"
+        ),
+    )
+    suap.add_argument(
+        "--mcp-metadata",
+        metavar="NAME=PATH",
+        action="append",
+        help=(
+            "metadados locais (NAME=PATH) a varrer por Unicode oculto para o "
+            "checkpoint MCP NAME do plano; repetível, exigido para cada "
+            "checkpoint junto de --mcp-artifact"
+        ),
     )
     suap.set_defaults(fn=_cmd_setup_apply)
 
