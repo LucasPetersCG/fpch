@@ -469,3 +469,27 @@ Os demais quatro achados, todos corrigidos:
 **Dívida achada, registrada como C26 no `TODO.md`, não decisão:** `policy.py` `ImmutableBlock.referencia` aponta `backends.py:128-129` e `cannibalize.py:208-247`, ambos defasados — o primeiro porque C18 reescreveu boa parte de `backends.py` ao redor dessas linhas, o segundo desde C17. São blocos de **política imutável**; corrigir a referência é edição mecânica, mas sobre um bloco marcado imutável, o que pede confirmação explícita antes de tocar.
 
 C4 e C7 continuam parciais; C15, C23 e C25 continuam abertos.
+
+## 38. Apêndice de desenvolvimento: *smoke test* real de C18 em `agy` (14/09/2026)
+
+**Autorização e escopo.** Ainda em 14/09/2026, o autor autorizou o primeiro *smoke test* real de C18 — chamadas reais a modelo, fora do desenvolvimento em si, para medir o cumprimento da sentinela antes de confiar nela no dia a dia (o ponto [AUTOR] mais importante do §37). O pedido original era pelo menor modelo "flash lite" disponível; **não existe modelo "Lite" no `agy`**. A lista viva, obtida por `agy --model __invalido__`, oferece: Gemini 3.8/3.7/3.6 Flash (High/Medium/Low), Gemini 3.1 Pro (High/Low), Claude Sonnet 4.6 (Thinking), Claude Opus 4.6 (Thinking) e GPT-OSS 120B (Medium). O menor da lista é **Gemini 3.6 Flash (Low)**, e foi o modelo usado. As chamadas passaram pelo `backends.invoke` real (*sandbox*, sem escrita), com o id do modelo sobrescrito via `dataclasses.replace`. As saídas cruas ficaram só no *scratchpad* da sessão, não versionadas.
+
+**Resultado positivo: 3/3 conformes, 0 falsos-falha.**
+
+| caso | formato do prompt | ok | latência | observação |
+|---|---|---|---|---|
+| prosa | 3 frases | true | 6,16 s | sentinela na última linha |
+| lista | marcadores markdown | true | 5,14 s | sentinela depois do último item |
+| código | "somente um bloco de código" | true | 4,33 s | sentinela em linha própria **depois** do fechamento do bloco; o texto limpo termina na cerca de fechamento |
+
+Nos três casos, `contract="sentinela"`, `failure_signature=null`, e não houve texto depois da sentinela. A dúvida registrada no §36 sobre `agy -p` imprimir texto depois da resposta **não foi observada nesta amostra**.
+
+**Resultado negativo real: a falha de 16/07/2026 reproduzida e capturada.** Prompt: buscar `https://example.com/` e resumir. O `agy` imprimiu `jetski: no output produced — a tool required the "read_url" permission that headless mode cannot prompt for, so it was auto-denied…` e saiu com **exit 0**. Resultado: `ok=false`, `contract="sentinela"`, `failure_signature="no output produced"`, erro começando com `contrato de saída não cumprido: sentinela ausente; assinatura: 'no output produced' — jetski: …`. Antes de C18, só a *denylist* literal capturaria isso; agora o contrato falha fechado independentemente da redação, e a *denylist* preserva o diagnóstico.
+
+**Limites da evidência.** n=3 positivo e n=1 negativo, num único modelo. Isto não é uma taxa de conformidade. Os demais modelos do `agy` (3.7/3.8 Flash, Pro, Claude via `agy`, GPT-OSS) e o `copilot` seguem sem medição. Vale a regra do projeto: resultado que confirma a hipótese merece mais ceticismo, não menos — este resultado favorável não deve ser lido como prova.
+
+## 39. Achado novo e dívida: catálogo de modelos do FPCH desatualizado (registrado como C27)
+
+O catálogo de modelos do FPCH (`src/fpch/models.py`, `CATALOG`) está desatualizado: lista `Gemini 3.5 Flash (Low|Medium|High)`, que o `agy` não aceita mais, e não tem 3.6/3.7/3.8 Flash. Rotear para essas entradas do catálogo falharia na invocação. Os valores de `power`/`cost` do catálogo são julgamento do autor, então a atualização não foi feita sem pedido. Registrado como **C27** no `TODO.md`.
+
+C4 e C7 continuam parciais; C15, C23 e C25 continuam abertos.
