@@ -308,3 +308,27 @@ def test_dump_mostra_origem_de_arquivo(_isola_cascata):
     # bloco não tocado pelo arquivo continua marcado como default embutido.
     linha_backends = next(l for l in saida.splitlines() if l.startswith("[backends]"))
     assert "default embutido" in linha_backends
+
+
+def test_catalogo_nao_cita_gemini_3_5_flash():
+    """`agy` deixou de aceitar a família 3.5 Flash (ping real de 14/09/2026)."""
+    assert not [m.id for m in models.CATALOG if "3.5" in m.id]
+    assert not [m.id for m in policy._default().modelos if "3.5" in m.id]
+
+
+def test_todo_modelo_codex_do_catalogo_e_traduzivel_em_flags():
+    from fpch import backends
+
+    codex = [m for m in models.CATALOG if m.backend == "codex"]
+    assert codex, "o catálogo embutido deve ter modelos codex"
+    for m in codex:
+        assert m.pool is models.Pool.CODEX
+        slug, esforco = backends.fpch_codex_id(m.id)
+        assert esforco in backends.FPCH_CODEX_ESFORCOS
+        assert slug not in {"gpt-reserve", "codex-auto-review"}, "modelo oculto não entra"
+
+
+def test_todo_backend_do_catalogo_tem_adaptador():
+    from fpch import backends
+
+    assert {m.backend for m in models.CATALOG} <= set(backends.ADAPTERS)

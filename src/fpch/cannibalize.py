@@ -537,11 +537,12 @@ honest attribution matter as much as utility.
 
 CURRENT STATE OF FPCH's CODE (as of 2026-07-16 — this is all of it):
 - `src/fpch/models.py` — catalogue of models grouped by QUOTA POOL (agy:google =
-  Gemini 3.5 Flash Low/Medium/High + Gemini 3.1 Pro Low/High + GPT-OSS 120B;
-  agy:anthropic = Claude Sonnet/Opus 4.6, a SEPARATE quota; copilot; claude).
+  Gemini 3.8/3.7/3.6 Flash Low/Medium/High + Gemini 3.1 Pro Low/High + GPT-OSS 120B;
+  agy:anthropic = Claude Sonnet/Opus 4.6, a SEPARATE quota; copilot; codex =
+  GPT-5.x/6 via the ChatGPT subscription, another separate quota; claude).
   Each model has hand-assigned power/cost and the task classes it serves.
 - `src/fpch/backends.py` — invokes ONLY official vendor CLIs headless (`agy -p`,
-  `copilot -p`, `claude -p`) via argv list, shell=False. Never touches tokens.
+  `copilot -p`, `claude -p`, `codex exec`) via argv list, shell=False. Never touches tokens.
   Sandbox and read-only by default. Stages oversized prompts to a file.
 - `src/fpch/router.py` — routes by task class (mechanical/standard/hard/orchestration),
   cheapest-viable-first, escalates ONLY on objective failure (exit≠0, empty, timeout).

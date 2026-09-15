@@ -33,9 +33,13 @@ from fpch.models import Model, Pool, TaskClass
 BACKENDS = sorted(backends.ADAPTERS)
 
 
+#: O codex exige id no formato "<slug> (<esforço>)"; os demais aceitam qualquer id.
+_ID_DE_TESTE = {"codex": "modelo-de-teste (low)"}
+
+
 def _model(backend: str) -> Model:
     return Model(
-        id="modelo-de-teste",
+        id=_ID_DE_TESTE.get(backend, "modelo-de-teste"),
         backend=backend,
         pool=Pool.LOCAL,
         power=3,
@@ -54,6 +58,14 @@ def _nonce(argv: list[str]) -> str:
     achados = {m.group(1) for tok in argv for m in _NONCE_NA_INSTRUCAO.finditer(tok)}
     assert len(achados) == 1, f"esperava exatamente um nonce no argv, achei {achados}"
     return achados.pop()
+
+
+def _prompt(argv: list[str]) -> str:
+    """O prompt efetivo: após `-p` (agy/copilot/claude) ou o último, após `--` (codex)."""
+    if "-p" in argv:
+        return argv[argv.index("-p") + 1]
+    assert argv[-2] == "--", f"prompt sem `-p` tem de vir por último, após `--`: {argv}"
+    return argv[-1]
 
 
 def _sentinela(argv: list[str]) -> str:
@@ -575,7 +587,7 @@ def test_eco_do_prompt_com_a_instrucao_nao_cumpre_o_contrato(tmp_path, monkeypat
     """Erro de fornecedor que cita o prompt carrega a instrução — e o nonce."""
 
     def ecoa(argv):
-        prompt = argv[argv.index("-p") + 1]
+        prompt = _prompt(argv)
         return 0, f"Error: request could not be completed. Original prompt follows:\n{prompt}"
 
     _responde(monkeypatch, ecoa)
@@ -588,7 +600,7 @@ def test_eco_truncado_logo_depois_do_nonce_nao_cumpre(tmp_path, monkeypatch):
     """Eco cortado bem no nonce: a última linha termina no código, mas não é a sentinela."""
 
     def ecoa_truncado(argv):
-        prompt = argv[argv.index("-p") + 1]
+        prompt = _prompt(argv)
         corte = prompt.index(_nonce(argv)) + 16
         return 0, "upstream error while echoing input:\n" + prompt[:corte]
 
@@ -740,7 +752,8 @@ def test_envelope_estruturado_e_lacuna_declarada(backend):
     """
     cap = backends.ADAPTERS[backend].regime.saida_estruturada
     assert cap.suporte is backends.Suporte.AUSENTE
-    assert "--output-format json" in cap.mecanismo
+    # `agy`/`copilot`/`claude` chamam a flag `--output-format json`; o codex, `--json`.
+    assert "--output-format json" in cap.mecanismo or "--json" in cap.mecanismo
     assert "envelope" not in backends.FPCH_CONTRATOS
 
 
@@ -830,3 +843,220 @@ def test_failure_signature_tambem_quando_o_contrato_passa(tmp_path, monkeypatch)
 def test_sucesso_nao_tem_failure_signature(tmp_path, capturado):
     r = backends.invoke(_model("agy"), "oi", workdir=tmp_path)
     assert r.ok is True and r.failure_signature is None
+
+
+# ---------------------------------------------------------------------------
+# codex — id "<slug> (<esforço>)", mapeamento de sandbox, prompt por último
+# ---------------------------------------------------------------------------
+
+
+def _codex(model_id: str = "gpt-5.6-luna (medium)") -> Model:
+    return Model(
+        id=model_id, backend="codex", pool=Pool.CODEX, power=3, cost=2,
+        good_for=(TaskClass.STANDARD,),
+    )
+
+
+def test_argv_codex_caso_simples(tmp_path, capturado):
+    backends.invoke(_codex(), "oi", workdir=tmp_path)
+    argv = _argv(capturado)
+    assert argv[:2] == ["codex", "exec"]
+    assert "--skip-git-repo-check" in argv and "--ephemeral" in argv
+    assert _pares(argv, "-C") == [str(tmp_path)]
+    assert _pares(argv, "-m") == ["gpt-5.6-luna"]
+    assert _pares(argv, "-s") == ["read-only"]
+    assert argv[-2] == "--" and argv[-1].startswith("oi\n")
+    assert "OUTPUT CONTRACT" in argv[-1]
+
+
+@pytest.mark.parametrize(
+    ("model_id", "slug", "esforco"),
+    [
+        ("gpt-5.6-luna (low)", "gpt-5.6-luna", "low"),
+        ("gpt-5.5 (xhigh)", "gpt-5.5", "xhigh"),
+        ("gpt-6-astra (max)", "gpt-6-astra", "max"),
+    ],
+)
+def test_codex_esforco_vai_sempre_explicito(tmp_path, capturado, model_id, slug, esforco):
+    """A config do autor fixa `xhigh`: omitir o esforço herdaria o mais caro."""
+    backends.invoke(_codex(model_id), "oi", workdir=tmp_path)
+    argv = _argv(capturado)
+    assert _pares(argv, "-m") == [slug]
+    assert _pares(argv, "-c") == [f"model_reasoning_effort={esforco}"]
+
+
+@pytest.mark.parametrize(
+    "model_id",
+    [
+        "default",
+        "gpt-5.6-luna",
+        "gpt-5.6-luna (Low)",
+        "gpt-5.6-luna (turbo)",
+        "gpt-5.6-luna  (low)",
+        "-m evil (low)",
+        "gpt-5.6-luna (low) --dangerously-bypass-approvals-and-sandbox",
+        "",
+    ],
+)
+def test_codex_id_malformado_e_recusado_sem_invocar(tmp_path, capturado, model_id):
+    with pytest.raises(backends.FpchModeloMalformado, match="malformado"):
+        backends.invoke(_codex(model_id), "x" * (backends._ARG_LIMIT + 1), workdir=tmp_path)
+    assert capturado == []
+    assert list(tmp_path.glob("fpch-prompt-*.md")) == [], "id inválido não pode deixar arquivo"
+
+
+def test_codex_modelo_malformado_escala_no_router():
+    assert issubclass(backends.FpchModeloMalformado, backends.BackendUnavailable)
+
+
+@pytest.mark.parametrize(
+    ("sandbox", "allow_write", "modo"),
+    [
+        (True, False, "read-only"),
+        (True, True, "workspace-write"),
+        (False, False, "read-only"),
+    ],
+)
+def test_codex_mapeamento_de_sandbox(tmp_path, capturado, sandbox, allow_write, modo):
+    backends.invoke(_codex(), "oi", workdir=tmp_path, sandbox=sandbox, allow_write=allow_write)
+    assert _pares(_argv(capturado), "-s") == [modo]
+
+
+def test_codex_escrita_sem_sandbox_e_recusada(tmp_path, capturado):
+    """O único modo sem sandbox do codex é `danger-full-access` — nunca emitido."""
+    with pytest.raises(backends.ContainmentUnsupported):
+        backends.invoke(_codex(), "oi", workdir=tmp_path, sandbox=False, allow_write=True)
+    assert capturado == []
+
+
+@pytest.mark.parametrize("sandbox", [True, False])
+@pytest.mark.parametrize("allow_write", [True, False])
+def test_codex_nunca_emite_flag_perigosa(tmp_path, capturado, sandbox, allow_write):
+    try:
+        backends.invoke(
+            _codex(), "oi", workdir=tmp_path, sandbox=sandbox, allow_write=allow_write,
+            extra_dirs=[tmp_path / "clone"],
+        )
+    except backends.ContainmentUnsupported:
+        return
+    flags = _argv(capturado)[:-1]  # o último token é o prompt, que é dado
+    assert "danger-full-access" not in flags
+    assert not any(t.startswith("--dangerously") for t in flags)
+
+
+def test_codex_prompt_que_parece_flag_fica_depois_do_separador(tmp_path, monkeypatch):
+    # Sem contrato (sem nonce), para o prompt chegar ao argv exatamente como veio.
+    chamadas = _responde(monkeypatch, lambda argv: (0, RESPOSTA_PLAUSIVEL))
+    backends.invoke(
+        _codex(), "--dangerously-bypass-approvals-and-sandbox", workdir=tmp_path,
+        extra_dirs=[tmp_path / "a", tmp_path / "b"], output_contract=False,
+    )
+    [argv] = chamadas
+    assert argv[-2:] == ["--", "--dangerously-bypass-approvals-and-sandbox"]
+    assert argv.count("--") == 1
+    assert _pares(argv, "--add-dir") == [str(tmp_path / "a"), str(tmp_path / "b")]
+
+
+def test_codex_prompt_so_hifen_e_recusado(tmp_path, capturado):
+    """`-` posicional é "leia do stdin" — mesmo depois de `--`."""
+    with pytest.raises(backends.BackendUnavailable):
+        backends.invoke(_codex(), "-", workdir=tmp_path, output_contract=False)
+    assert capturado == []
+
+
+def test_codex_prompt_longo_nao_acrescenta_add_dir_do_workdir(tmp_path, capturado):
+    """O arquivo encaminhado mora no workdir, que o `-C` já expõe."""
+    backends.invoke(_codex(), "w" * (backends._ARG_LIMIT + 1), workdir=tmp_path)
+    assert _pares(_argv(capturado), "--add-dir") == []
+
+
+# ---------------------------------------------------------------------------
+# Resolução de executável no Windows (shim .cmd do npm)
+# ---------------------------------------------------------------------------
+
+
+def _which_falso(monkeypatch, mapa: dict[str, str]):
+    monkeypatch.setattr(backends.shutil, "which", lambda nome: mapa.get(nome))
+
+
+def _shim_npm(pasta, nome: str, alvo: str) -> str:
+    alvo_path = pasta.joinpath(*alvo.split("\\"))
+    alvo_path.parent.mkdir(parents=True, exist_ok=True)
+    alvo_path.write_text("", encoding="utf-8")
+    shim = pasta / f"{nome}.cmd"
+    shim.write_text(
+        "@ECHO off\r\nSETLOCAL\r\nCALL :find_dp0\r\n"
+        'endLocal & goto #_undefined_# 2>NUL || title %COMSPEC% & "%_prog%"  '
+        f'"%dp0%\\{alvo}" %*\r\n',
+        encoding="utf-8",
+    )
+    return str(shim)
+
+
+def test_resolve_fora_do_windows_nao_mexe(monkeypatch):
+    _which_falso(monkeypatch, {})
+    assert backends._resolve_executavel(["codex", "exec"], windows=False) == ["codex", "exec"]
+
+
+def test_resolve_exe_no_path_fica_intacto(monkeypatch, tmp_path):
+    """Caso do agy e do copilot: `CreateProcess` já acha o `.exe`."""
+    _which_falso(monkeypatch, {
+        "copilot.exe": str(tmp_path / "copilot.exe"),
+        "copilot": str(tmp_path / "copilot.bat"),
+    })
+    argv = ["copilot", "-p", "x"]
+    assert backends._resolve_executavel(argv, windows=True) == argv
+
+
+def test_resolve_shim_npm_de_script_vira_node(monkeypatch, tmp_path):
+    shim = _shim_npm(tmp_path, "codex", "node_modules\\@openai\\codex\\bin\\codex.js")
+    _which_falso(monkeypatch, {"codex": shim, "node.exe": "C:\\node\\node.exe"})
+    prompt = 'linha 1\nlinha "2" & echo PWNED %PATH%'
+    argv = backends._resolve_executavel(["codex", "exec", "--", prompt], windows=True)
+    assert argv[0] == "C:\\node\\node.exe"
+    assert argv[1] == str(tmp_path / "node_modules" / "@openai" / "codex" / "bin" / "codex.js")
+    assert argv[2:] == ["exec", "--", prompt], "os argumentos seguem intactos, sem cmd.exe"
+
+
+def test_resolve_shim_npm_de_binario_nativo_vira_exe(monkeypatch, tmp_path):
+    shim = _shim_npm(tmp_path, "claude", "node_modules\\@anthropic-ai\\claude-code\\bin\\claude.exe")
+    _which_falso(monkeypatch, {"claude": shim})
+    argv = backends._resolve_executavel(["claude", "-p", "x"], windows=True)
+    exe = tmp_path / "node_modules" / "@anthropic-ai" / "claude-code" / "bin" / "claude.exe"
+    assert argv == [str(exe), "-p", "x"]
+
+
+def test_resolve_cmd_desconhecido_e_recusado(monkeypatch, tmp_path):
+    """Executar um .cmd qualquer passaria o prompt pelo cmd.exe."""
+    shim = tmp_path / "coisa.cmd"
+    shim.write_text("@echo off\r\nalgo.exe %*\r\n", encoding="utf-8")
+    _which_falso(monkeypatch, {"coisa": str(shim)})
+    with pytest.raises(backends.BackendUnavailable, match="cmd.exe"):
+        backends._resolve_executavel(["coisa", "x"], windows=True)
+
+
+def test_resolve_shim_de_script_sem_node_e_recusado(monkeypatch, tmp_path):
+    shim = _shim_npm(tmp_path, "codex", "node_modules\\@openai\\codex\\bin\\codex.js")
+    _which_falso(monkeypatch, {"codex": shim})
+    with pytest.raises(backends.BackendUnavailable, match="node.exe"):
+        backends._resolve_executavel(["codex"], windows=True)
+
+
+def test_run_fecha_stdin_do_processo(monkeypatch):
+    """`_run` nunca herda stdin: `codex exec` anexaria um stdin em pipe ao prompt."""
+    visto = {}
+
+    class _Proc:
+        returncode = 0
+        stdout = "ok"
+        stderr = ""
+
+    def fake_subprocess_run(argv, **kw):
+        visto.update(kw)
+        return _Proc()
+
+    monkeypatch.setattr(backends.subprocess, "run", fake_subprocess_run)
+    monkeypatch.setattr(backends, "_resolve_executavel", lambda argv, **_: argv)
+    assert backends._run(["qualquer"], 5) == (0, "ok")
+    assert visto["stdin"] is backends.subprocess.DEVNULL
+    assert visto["shell"] is False

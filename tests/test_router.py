@@ -18,7 +18,7 @@ import pytest
 from fpch import audit, backends, router
 from fpch.models import BY_ID, Pool, TaskClass
 
-MODELO_FIXO = "Gemini 3.5 Flash (Low)"
+MODELO_FIXO = "Gemini 3.8 Flash (Low)"
 
 
 @pytest.fixture(autouse=True)

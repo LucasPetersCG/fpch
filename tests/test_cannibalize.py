@@ -626,7 +626,8 @@ def test_ficha_ponta_a_ponta_nao_contem_sentinela(
     sentinelas: list[str] = []
 
     def fake_run(argv, timeout_s, cwd=None):
-        prompt = argv[argv.index("-p") + 1]
+        # `-p <prompt>` em agy/copilot/claude; no codex o prompt é o último, após `--`.
+        prompt = argv[argv.index("-p") + 1] if "-p" in argv else argv[-1]
         prompts.append(prompt)
         [nonce] = set(nonce_re.findall(prompt))
         sentinela = f"FPCH-FIM-{nonce}"

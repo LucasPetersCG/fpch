@@ -145,7 +145,7 @@ def test_policy_muda_o_catalogo_que_models_imprime(tmp_path, capsys):
     assert cli.main(["--policy", str(p), "models"]) == 0
     saida = capsys.readouterr().out
     assert "Modelo Fictício" in saida
-    assert "Gemini 3.5 Flash (Medium)" not in saida, "o catálogo embutido não deve vazar"
+    assert "Gemini 3.8 Flash (Medium)" not in saida, "o catálogo embutido não deve vazar"
     assert str(p) in saida, "a origem da política precisa aparecer"
 
 
@@ -153,7 +153,7 @@ def test_sem_policy_a_cli_usa_o_default_embutido(tmp_path, capsys):
     assert cli.main(["models"]) == 0
     saida = capsys.readouterr().out
     assert "default embutido" in saida
-    assert "Gemini 3.5 Flash (Medium)" in saida
+    assert "Gemini 3.8 Flash (Medium)" in saida
 
 
 def test_catalogo_em_vigor_nao_vaza_depois_do_comando(tmp_path):

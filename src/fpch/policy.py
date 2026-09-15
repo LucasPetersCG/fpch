@@ -66,7 +66,7 @@ from .audit import CAUSE_TAXONOMY
 # original — se `models.py` ganhar um pool ou uma classe nova, o teste falha
 # até alguém atualizar as duas constantes abaixo.
 # --------------------------------------------------------------------------
-POOLS_VALIDOS = frozenset({"agy:google", "agy:anthropic", "copilot", "claude", "local"})
+POOLS_VALIDOS = frozenset({"agy:google", "agy:anthropic", "copilot", "codex", "claude", "local"})
 TASK_CLASSES_VALIDAS = frozenset({"mechanical", "standard", "hard", "orchestration"})
 
 
@@ -247,14 +247,32 @@ class Policy:
 
 _DEFAULT_MODELS: tuple[ModelEntry, ...] = (
     # --- agy / cota Google ---------------------------------------------
-    ModelEntry("Gemini 3.5 Flash (Low)", "agy", "agy:google", power=2, cost=1,
+    ModelEntry("Gemini 3.8 Flash (Low)", "agy", "agy:google", power=2, cost=1,
                good_for=("mechanical",),
                notes="Piso do arsenal. Só é escolhido se Medium falhar — custa o mesmo e é mais fraco."),
-    ModelEntry("Gemini 3.5 Flash (Medium)", "agy", "agy:google", power=3, cost=1,
+    ModelEntry("Gemini 3.8 Flash (Medium)", "agy", "agy:google", power=3, cost=1,
                good_for=("mechanical", "standard")),
-    ModelEntry("Gemini 3.5 Flash (High)", "agy", "agy:google", power=3, cost=2,
+    ModelEntry("Gemini 3.8 Flash (High)", "agy", "agy:google", power=3, cost=2,
                good_for=("mechanical", "standard"),
                notes="Cavalo de batalha indicado pelo autor: rápido e bom até tarefa mediana."),
+    ModelEntry("Gemini 3.7 Flash (Low)", "agy", "agy:google", power=2, cost=1,
+               good_for=("mechanical",),
+               notes="Fallback do Gemini 3.8 Flash (Low)."),
+    ModelEntry("Gemini 3.7 Flash (Medium)", "agy", "agy:google", power=3, cost=1,
+               good_for=("mechanical", "standard"),
+               notes="Fallback do Gemini 3.8 Flash (Medium)."),
+    ModelEntry("Gemini 3.7 Flash (High)", "agy", "agy:google", power=3, cost=2,
+               good_for=("mechanical", "standard"),
+               notes="Fallback do Gemini 3.8 Flash (High)."),
+    ModelEntry("Gemini 3.6 Flash (Low)", "agy", "agy:google", power=2, cost=1,
+               good_for=("mechanical",),
+               notes="Fallback do Gemini 3.7 Flash (Low)."),
+    ModelEntry("Gemini 3.6 Flash (Medium)", "agy", "agy:google", power=3, cost=1,
+               good_for=("mechanical", "standard"),
+               notes="Fallback do Gemini 3.7 Flash (Medium)."),
+    ModelEntry("Gemini 3.6 Flash (High)", "agy", "agy:google", power=3, cost=2,
+               good_for=("mechanical", "standard"),
+               notes="Fallback do Gemini 3.7 Flash (High)."),
     ModelEntry("Gemini 3.1 Pro (Low)", "agy", "agy:google", power=4, cost=2,
                good_for=("standard",)),
     ModelEntry("Gemini 3.1 Pro (High)", "agy", "agy:google", power=4, cost=3,
@@ -270,9 +288,25 @@ _DEFAULT_MODELS: tuple[ModelEntry, ...] = (
                good_for=("hard",),
                notes="Caro (autor). Só quando Gemini 3.1 Pro (High) não dá conta."),
     # --- copilot ----------------------------------------------------------
-    ModelEntry("default", "copilot", "copilot", power=4, cost=3,
-               good_for=("standard", "hard"),
-               notes="Backend mais maduro: reporta AI credits, tem --max-ai-credits e allowlist."),
+    ModelEntry("default", "copilot", "copilot", power=2, cost=2,
+               good_for=("mechanical", "standard"),
+               notes="Resolve via auto para mai-code-1.1-flash (única availableModel em "
+                     "14/09/2026). --model explícito é recusado com exit 0 nesta conta."),
+    # --- codex / assinatura ChatGPT (cota à parte); power/cost provisórios
+    ModelEntry("gpt-5.6-luna (low)", "codex", "codex", power=3, cost=1,
+               good_for=("mechanical",)),
+    ModelEntry("gpt-5.6-luna (medium)", "codex", "codex", power=3, cost=2,
+               good_for=("mechanical", "standard")),
+    ModelEntry("gpt-5.6-terra (medium)", "codex", "codex", power=4, cost=2,
+               good_for=("standard",)),
+    ModelEntry("gpt-5.5 (medium)", "codex", "codex", power=4, cost=2,
+               good_for=("standard",),
+               notes="Geração anterior."),
+    ModelEntry("gpt-5.6-sol (high)", "codex", "codex", power=5, cost=3,
+               good_for=("standard", "hard")),
+    ModelEntry("gpt-6-astra (high)", "codex", "codex", power=5, cost=4,
+               good_for=("hard",),
+               notes="Topo da lista — gastar com parcimônia."),
 )
 
 # O default embutido NÃO declara hook algum, e isso é deliberado mesmo depois de

@@ -30,6 +30,7 @@ em profundidade, depois do contrato — nunca no lugar dele.
 
 from __future__ import annotations
 
+import os
 import re
 import secrets
 import shutil
@@ -604,17 +605,230 @@ class ClaudeAdapter:
         return argv
 
 
+class FpchModeloMalformado(BackendUnavailable):
+    """`model.id` fora do formato que o adaptador sabe traduzir em flags.
+
+    Herda de `BackendUnavailable` pelo mesmo motivo de `ContainmentUnsupported`:
+    o router registra o erro na trilha e escala, em vez de derrubar a execução
+    por causa de uma entrada de catálogo (que pode vir de política do operador).
+    """
+
+
+#: Esforços de raciocínio aceitos no id do codex. Vocabulário FECHADO: o valor
+#: vai para `-c model_reasoning_effort=<esforço>`, e nada fora desta lista chega
+#: ao argv. Verificado em `~/.codex/models_cache.json` (14/09/2026).
+FPCH_CODEX_ESFORCOS = ("low", "medium", "high", "xhigh", "max")
+
+# "<slug> (<esforço>)". O slug não pode começar por "-" (não vira flag) e não tem
+# espaço; o esforço é um dos valores fechados acima.
+_CODEX_ID_RE = re.compile(
+    r"^(?P<slug>[A-Za-z0-9][A-Za-z0-9._-]*) \((?P<esforco>" + "|".join(FPCH_CODEX_ESFORCOS) + r")\)$"
+)
+
+
+def fpch_codex_id(model_id: str) -> tuple[str, str]:
+    """Separa `"gpt-5.6-luna (low)"` em `("gpt-5.6-luna", "low")`.
+
+    Levanta `FpchModeloMalformado` nomeando o id e o formato esperado.
+    """
+    achado = _CODEX_ID_RE.match(model_id)
+    if achado is None:
+        raise FpchModeloMalformado(
+            f"codex: id de modelo malformado {model_id!r} — esperado '<slug> (<esforço>)' "
+            f"com esforço em {FPCH_CODEX_ESFORCOS}, ex.: 'gpt-5.6-luna (low)'"
+        )
+    return achado.group("slug"), achado.group("esforco")
+
+
+@dataclass(frozen=True)
+class CodexAdapter:
+    """OpenAI Codex CLI. Flags verificadas em `codex exec --help` (codex-cli
+    0.154.0, 14/09/2026) e em ping real do autor na mesma data.
+
+    O que existe: `exec` (headless), prompt POSICIONAL (ou `-` para stdin),
+    `-m/--model`, `-c/--config <key=value>`, `-s/--sandbox (read-only |
+    workspace-write | danger-full-access)`, `-C/--cd <DIR>`, `--add-dir <DIR>`
+    ("additional directories that should be writable"), `--skip-git-repo-check`,
+    `--ephemeral`, `--color`, `--json` (JSONL), `-o/--output-last-message`,
+    `--ignore-user-config`, `--dangerously-bypass-approvals-and-sandbox`.
+    O `--` separador é aceito: `codex exec -- -x extra` recusa `extra` como
+    argumento inesperado, ou seja, `-x` foi lido como PROMPT (dry parse, sem
+    modelo).
+
+    **Esforço sempre explícito.** A config do autor (`~/.codex/config.toml`) fixa
+    `model_reasoning_effort="xhigh"`; omitir o esforço herdaria o mais caro. Por
+    isso o id do catálogo carrega o esforço — `"<slug> (<esforço>)"`, espelhando
+    a nomenclatura do agy — e `-c model_reasoning_effort=<esforço>` vai em toda
+    chamada. Sem aspas TOML de propósito: é a forma que o ping real entregou ao
+    binário (o shell removeu as aspas), e o `--help` documenta que valor que não
+    é TOML válido vira texto literal.
+
+    **Contenção — mapeamento escolhido.** O `-s` é sandbox de SO do próprio
+    codex para os comandos gerados pelo modelo (e as escritas de arquivo passam
+    pela mesma política):
+
+    - `sandbox=True, allow_write=False` → `-s read-only`;
+    - `sandbox=True, allow_write=True`  → `-s workspace-write` — escrita confinada
+      ao `-C` e aos `--add-dir`. Diferente do agy e do claude, aqui "contido E
+      podendo escrever" é um estado que o CLI de fato sabe ocupar;
+    - `sandbox=False, allow_write=False` → `-s read-only`: o bloqueio de escrita
+      pedido só existe dentro do sandbox, e contenção a mais não é promessa falsa;
+    - `sandbox=False, allow_write=True` → RECUSA. O único modo do codex sem
+      sandbox é `danger-full-access` (ou `--dangerously-bypass-*`), que este
+      adaptador nunca emite. Rebaixar para `workspace-write` em silêncio seria
+      entregar outra coisa que não a pedida.
+
+    Lacunas declaradas, não verificáveis sem invocar modelo: (1) a aplicação
+    efetiva do sandbox no Windows; (2) `read-only` do codex permite LER o disco
+    todo — contém escrita, não leitura; (3) plugins/MCP carregados da config do
+    usuário rodam fora do `-s`, e `--ignore-user-config` existe mas não foi
+    validado por chamada real. O stdin em pipe, que o `--help` diz ser anexado
+    ao prompt, é fechado por `_run` (`stdin=DEVNULL`).
+
+    **Contrato C18.** `codex exec` escreve em stdout SÓ a mensagem final do
+    agente; logs, hooks e "tokens used" vão para stderr (ping real, 14/09/2026).
+    Logo a sentinela fica na última linha sem flag extra — o análogo do
+    `--silent` do copilot já é o comportamento padrão. `--json` existe, mas o
+    esquema dos eventos não é documentado: sem parser, contrato por sentinela.
+    """
+
+    nome: str = "codex"
+    regime: Regime = Regime(
+        isolamento=Capacidade(
+            Suporte.FLAG,
+            "-s read-only | -s workspace-write (sandbox do codex; aplicação no Windows "
+            "e ferramentas de plugin/MCP da config do usuário não verificadas)",
+        ),
+        bloqueio_escrita=Capacidade(Suporte.FLAG, "-s read-only"),
+        concessao_escrita=Capacidade(
+            Suporte.FLAG,
+            "-s workspace-write (escrita confinada ao -C e aos --add-dir); exige "
+            "sandbox=True — danger-full-access nunca é emitido",
+        ),
+        workdir=Capacidade(Suporte.FLAG, "-C <DIR> (e cwd do processo)"),
+        extra_dirs=Capacidade(
+            Suporte.FLAG,
+            "--add-dir (repetível; sob workspace-write o diretório também fica gravável)",
+        ),
+        prompt_longo=Capacidade(
+            Suporte.FLAG,
+            "arquivo encaminhado dentro do workdir, que o -C já torna a raiz do agente",
+        ),
+        saida_estruturada=Capacidade(
+            Suporte.AUSENTE,
+            "--json (JSONL) existe no --help (0.154.0), mas o esquema dos eventos não "
+            "é documentado; verificar exigiria invocar modelo",
+        ),
+    )
+
+    def build_argv(self, model: Model, prompt: str, ctx: Ctx) -> list[str]:
+        if ctx.allow_write and not ctx.sandbox:
+            # Escrita sem sandbox só existe via danger-full-access — proibido aqui.
+            raise _recusa(self.nome, "concessao_escrita", self.regime.concessao_escrita)
+
+        # Antes de `_stage_prompt`: id malformado não pode deixar arquivo para trás.
+        slug, esforco = fpch_codex_id(model.id)
+
+        # Prompt encaminhado fica no workdir, que o `-C` já expõe ao agente: não há
+        # `--add-dir` a acrescentar por causa dele.
+        efetivo, _encaminhado = _stage_prompt(prompt, ctx.workdir, ctx.instrucao_saida)
+        if efetivo == "-":
+            # `-` posicional é "leia o prompt do stdin", mesmo depois de `--`.
+            raise BackendUnavailable(
+                "codex: prompt igual a '-' seria lido como pedido de stdin; recusando"
+            )
+
+        modo = "workspace-write" if ctx.allow_write else "read-only"
+        argv = [
+            "codex", "exec",
+            "--skip-git-repo-check",
+            "--ephemeral",
+            "--color", "never",
+            "-C", str(ctx.workdir),
+            "-s", modo,
+            "-m", slug,
+            "-c", f"model_reasoning_effort={esforco}",
+        ]
+        for d in ctx.extra_dirs:
+            argv += ["--add-dir", str(d)]
+
+        # O prompt é o último argumento, depois de `--`: um prompt que comece por
+        # `-` não pode ser lido como flag (verificado por dry parse, ver docstring).
+        argv += ["--", efetivo]
+        return argv
+
+
 # Despacho por dicionário, no lugar da cadeia if/elif. Acrescentar backend passa
 # a ser acrescentar uma entrada aqui — e a declaração de regime que vem junto.
 ADAPTERS: dict[str, BackendAdapter] = {
-    a.nome: a for a in (AgyAdapter(), CopilotAdapter(), ClaudeAdapter())
+    a.nome: a for a in (AgyAdapter(), CopilotAdapter(), ClaudeAdapter(), CodexAdapter())
 }
 
 
+# Shim `.cmd` gerado pelo npm: `"%dp0%\node_modules\<pacote>\bin\<script>.js" %*`,
+# ou `"%dp0%\node_modules\<pacote>\bin\<nome>.exe" %*` em pacote com binário nativo.
+_NPM_SHIM_ALVO_RE = re.compile(r'"%dp0%\\(node_modules\\[^"%]+?\.(?:js|exe))"', re.IGNORECASE)
+
+
+def _resolve_executavel(argv: list[str], *, windows: bool | None = None) -> list[str]:
+    """No Windows, troca um shim `.cmd`/`.bat` do npm por `node <script.js>`.
+
+    `subprocess` sem shell usa `CreateProcess`, que só completa `.exe` ao buscar
+    no PATH: `codex` (instalado via npm, só existe `codex.cmd`) dava
+    `FileNotFoundError` embora `available()` dissesse que sim. Executar o `.cmd`
+    diretamente também não serve: ele passa pelo `cmd.exe`, que reinterpreta
+    `&`, `|`, `%`, aspas e corta o argumento na quebra de linha — o prompt (com a
+    instrução do contrato) chegaria truncado ou viraria comando.
+
+    Regras, na ordem: fora do Windows, nome com caminho/extensão, ou `<nome>.exe`
+    no PATH → argv intacto (é o que o `CreateProcess` já acha — caso do agy e do
+    copilot). Shim do npm reconhecível → `[node, script.js, *resto]` (codex) ou
+    `[binario.exe, *resto]` (claude, pacote com binário nativo), como o próprio
+    shim faria. Qualquer outro `.cmd`/`.bat` → `BackendUnavailable`.
+    """
+    if windows is None:
+        windows = os.name == "nt"
+    nome = argv[0]
+    if not windows or Path(nome).name != nome or Path(nome).suffix:
+        return argv
+    if shutil.which(nome + ".exe") is not None:
+        return argv
+    achado = shutil.which(nome)
+    if achado is None or Path(achado).suffix.lower() not in (".cmd", ".bat"):
+        return argv
+
+    shim = Path(achado)
+    try:
+        conteudo = shim.read_text(encoding="utf-8", errors="replace")
+    except OSError as exc:
+        raise BackendUnavailable(f"{nome}: shim {shim} ilegível ({exc})") from None
+    casado = _NPM_SHIM_ALVO_RE.search(conteudo)
+    alvo = shim.parent / casado.group(1) if casado else None
+    if alvo is None or not alvo.is_file():
+        raise BackendUnavailable(
+            f"{nome}: resolve para {shim}, um .cmd/.bat que não é shim do npm reconhecível. "
+            f"Executá-lo passaria o prompt pelo cmd.exe; recusando."
+        )
+    if alvo.suffix.lower() == ".exe":
+        return [str(alvo), *argv[1:]]
+    node_local = shim.parent / "node.exe"
+    node = str(node_local) if node_local.is_file() else shutil.which("node.exe")
+    if node is None:
+        raise BackendUnavailable(f"{nome}: shim do npm em {shim}, mas node.exe não está no PATH")
+    return [node, str(alvo), *argv[1:]]
+
+
 def _run(argv: list[str], timeout_s: int, cwd: Path | None = None) -> tuple[int, str]:
-    """Executa sem shell. `argv` é lista — nunca string interpolada."""
+    """Executa sem shell. `argv` é lista — nunca string interpolada.
+
+    `stdin=DEVNULL`: nenhum dos CLIs recebe o prompt por stdin, e herdar o stdin
+    do processo é perigoso — `codex exec` anexa stdin em pipe ao prompt (`--help`,
+    0.154.0), e um pipe aberto e nunca fechado deixaria a chamada esperando até o
+    timeout. Sem stdin, o prompt é exatamente o que o argv diz.
+    """
     proc = subprocess.run(
-        argv,
+        _resolve_executavel(argv),
+        stdin=subprocess.DEVNULL,
         capture_output=True,
         text=True,
         encoding="utf-8",

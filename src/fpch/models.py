@@ -1,7 +1,10 @@
 """Catálogo de modelos e pools de cota do FPCH.
 
-Verificado empiricamente em 16/07/2026 na máquina do autor via
-`agy --model __invalido__` (o erro enumera os modelos aceitos).
+Verificado empiricamente em 14/09/2026 na máquina do autor: `agy --model
+__invalido__` (o erro enumera os modelos aceitos) seguido de ping real, uma
+chamada por modelo com checagem de eco de token, em `agy`, `copilot` e `codex`.
+A verificação anterior (16/07/2026) listava a família Gemini 3.5 Flash, que o
+`agy` deixou de aceitar.
 
 Conceito central: POOL DE COTA. O mesmo CLI (`agy`) fala com modelos que
 consomem cotas DIFERENTES e independentes. Rotear ignorando o pool desperdiça
@@ -39,6 +42,7 @@ class Pool(str, Enum):
     AGY_GOOGLE = "agy:google"        # Gemini + GPT-OSS via assinatura Antigravity
     AGY_ANTHROPIC = "agy:anthropic"  # Claude via assinatura Antigravity (cota à parte)
     COPILOT = "copilot"              # GitHub Copilot AI credits
+    CODEX = "codex"                  # assinatura ChatGPT/Codex (cota à parte)
     CLAUDE_SUB = "claude"            # assinatura Anthropic direta (a do host)
     LOCAL = "local"                  # Ollama etc. — custo real zero
 
@@ -74,14 +78,35 @@ class Model:
 # Ordem importa: dentro de um pool, o primeiro que serve à classe é o preferido.
 CATALOG: tuple[Model, ...] = (
     # --- agy / cota Google -------------------------------------------------
-    Model("Gemini 3.5 Flash (Low)", "agy", Pool.AGY_GOOGLE, power=2, cost=1,
+    # Três gerações de Flash coexistem no `agy` (14/09/2026). Mesma potência e
+    # custo entre elas: o desempate de `candidates()` é a ordem, e por isso a
+    # geração mais nova vem primeiro e as anteriores ficam como fallback.
+    Model("Gemini 3.8 Flash (Low)", "agy", Pool.AGY_GOOGLE, power=2, cost=1,
           good_for=(TaskClass.MECHANICAL,),
           notes="Piso do arsenal. Só é escolhido se Medium falhar — custa o mesmo e é mais fraco."),
-    Model("Gemini 3.5 Flash (Medium)", "agy", Pool.AGY_GOOGLE, power=3, cost=1,
+    Model("Gemini 3.8 Flash (Medium)", "agy", Pool.AGY_GOOGLE, power=3, cost=1,
           good_for=(TaskClass.MECHANICAL, TaskClass.STANDARD)),
-    Model("Gemini 3.5 Flash (High)", "agy", Pool.AGY_GOOGLE, power=3, cost=2,
+    Model("Gemini 3.8 Flash (High)", "agy", Pool.AGY_GOOGLE, power=3, cost=2,
           good_for=(TaskClass.MECHANICAL, TaskClass.STANDARD),
           notes="Cavalo de batalha indicado pelo autor: rápido e bom até tarefa mediana."),
+    Model("Gemini 3.7 Flash (Low)", "agy", Pool.AGY_GOOGLE, power=2, cost=1,
+          good_for=(TaskClass.MECHANICAL,),
+          notes="Fallback do Gemini 3.8 Flash (Low)."),
+    Model("Gemini 3.7 Flash (Medium)", "agy", Pool.AGY_GOOGLE, power=3, cost=1,
+          good_for=(TaskClass.MECHANICAL, TaskClass.STANDARD),
+          notes="Fallback do Gemini 3.8 Flash (Medium)."),
+    Model("Gemini 3.7 Flash (High)", "agy", Pool.AGY_GOOGLE, power=3, cost=2,
+          good_for=(TaskClass.MECHANICAL, TaskClass.STANDARD),
+          notes="Fallback do Gemini 3.8 Flash (High)."),
+    Model("Gemini 3.6 Flash (Low)", "agy", Pool.AGY_GOOGLE, power=2, cost=1,
+          good_for=(TaskClass.MECHANICAL,),
+          notes="Fallback do Gemini 3.7 Flash (Low)."),
+    Model("Gemini 3.6 Flash (Medium)", "agy", Pool.AGY_GOOGLE, power=3, cost=1,
+          good_for=(TaskClass.MECHANICAL, TaskClass.STANDARD),
+          notes="Fallback do Gemini 3.7 Flash (Medium)."),
+    Model("Gemini 3.6 Flash (High)", "agy", Pool.AGY_GOOGLE, power=3, cost=2,
+          good_for=(TaskClass.MECHANICAL, TaskClass.STANDARD),
+          notes="Fallback do Gemini 3.7 Flash (High)."),
     Model("Gemini 3.1 Pro (Low)", "agy", Pool.AGY_GOOGLE, power=4, cost=2,
           good_for=(TaskClass.STANDARD,)),
     Model("Gemini 3.1 Pro (High)", "agy", Pool.AGY_GOOGLE, power=4, cost=3,
@@ -99,9 +124,30 @@ CATALOG: tuple[Model, ...] = (
           notes="Caro (autor). Só quando Gemini 3.1 Pro (High) não dá conta."),
 
     # --- copilot -----------------------------------------------------------
-    Model("default", "copilot", Pool.COPILOT, power=4, cost=3,
-          good_for=(TaskClass.STANDARD, TaskClass.HARD),
-          notes="Backend mais maduro: reporta AI credits, tem --max-ai-credits e allowlist."),
+    Model("default", "copilot", Pool.COPILOT, power=2, cost=2,
+          good_for=(TaskClass.MECHANICAL, TaskClass.STANDARD),
+          notes="Resolve via auto para mai-code-1.1-flash (única availableModel em "
+                "14/09/2026). --model explícito é recusado com exit 0 nesta conta."),
+
+    # --- codex / assinatura ChatGPT (cota à parte) -------------------------
+    # id no formato "<slug> (<esforço>)", espelhando a nomenclatura do agy; o
+    # adaptador separa as duas partes. power/cost são juízo provisório, pendente
+    # de revisão do autor — o ping de 14/09/2026 prova que a rota funciona, não
+    # mede capacidade.
+    Model("gpt-5.6-luna (low)", "codex", Pool.CODEX, power=3, cost=1,
+          good_for=(TaskClass.MECHANICAL,)),
+    Model("gpt-5.6-luna (medium)", "codex", Pool.CODEX, power=3, cost=2,
+          good_for=(TaskClass.MECHANICAL, TaskClass.STANDARD)),
+    Model("gpt-5.6-terra (medium)", "codex", Pool.CODEX, power=4, cost=2,
+          good_for=(TaskClass.STANDARD,)),
+    Model("gpt-5.5 (medium)", "codex", Pool.CODEX, power=4, cost=2,
+          good_for=(TaskClass.STANDARD,),
+          notes="Geração anterior."),
+    Model("gpt-5.6-sol (high)", "codex", Pool.CODEX, power=5, cost=3,
+          good_for=(TaskClass.STANDARD, TaskClass.HARD)),
+    Model("gpt-6-astra (high)", "codex", Pool.CODEX, power=5, cost=4,
+          good_for=(TaskClass.HARD,),
+          notes="Topo da lista — gastar com parcimônia."),
 )
 
 #: Índice do catálogo **em vigor**, por `id`.
