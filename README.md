@@ -122,4 +122,4 @@ Não fazem parte do núcleo do harness:
 
 ## Licença
 
-Licença: a definir.
+MIT. Ver [`LICENSE`](LICENSE).

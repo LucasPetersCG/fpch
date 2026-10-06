@@ -4,6 +4,7 @@ version = "0.1.0"
 description = "Personal Harness Constructor Framework — roteador multi-modelo e canibalizador de artefatos"
 readme = "README.md"
 requires-python = ">=3.11"
+license = "MIT"
 # Sem dependência externa, por decisão de arquitetura: o FPCH é instalado na
 # máquina de quem já usa CLIs de agent de terceiros, e cada dependência a mais é
 # superfície de ataque a mais na fase de instalação — que a literatura de 2026
