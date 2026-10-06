@@ -126,9 +126,10 @@ O mesmo binário (`agy`) fala com modelos que consomem **cotas independentes**. 
 
 | Pool | Modelos |
 |---|---|
-| `agy:google` | Gemini 3.5 Flash (Low/Medium/High), Gemini 3.1 Pro (Low/High), GPT-OSS 120B |
+| `agy:google` | Gemini 3.8 Flash (Low/Medium/High; 3.7 e 3.6 Flash como reserva), Gemini 3.1 Pro (Low/High), GPT-OSS 120B |
 | `agy:anthropic` | Claude Sonnet 4.6, Claude Opus 4.6 — **cota à parte** |
-| `copilot` | AI credits |
+| `copilot` | AI credits — só `default` (modo `auto`); todo `--model` explícito é recusado com exit 0 nesta conta (14/09/2026) |
+| `codex` | assinatura ChatGPT/Codex — **cota à parte**; 6 entradas `<slug> (<esforço>)`, de `gpt-5.6-luna (low)` a `gpt-6-astra (high)`, com `power`/`cost` provisórios (C28) |
 | `claude` | a assinatura do host |
 
 Política: começar pelo mais barato que plausivelmente resolve, escalar só diante de **falha objetiva** (exit≠0, vazio, timeout). Opus 4.6 **não entra na cadeia automática** — só via `--model`.
@@ -171,5 +172,5 @@ Essa é a linha real entre uso pretendido e banimento: o ilícito é **mentir so
 - `gemini` CLI **inutilizável** nesta conta (`IneligibleTierError`) — não está no catálogo.
 - `ollama` e `litellm` **não instalados** — a camada API-key (LiteLLM) ainda não existe. Só a camada assinatura está implementada.
 - Custo/potência dos modelos são **juízo do autor**, não medição. O audit log existe justamente para substituir isso por dado.
-- ~~Sem testes automatizados ainda.~~ **Superado:** 865 testes aprovados e 12 ignorados em `tests/` (20 arquivos, 10.797 linhas), `uv run --with pytest pytest tests/ -q`, medidos em 14/09/2026 (após C18). *Skip* não conta como aprovação; o detalhamento reproduzível fica em [`docs/analises/fpch-evidencias-desenvolvimento.md`](../docs/analises/fpch-evidencias-desenvolvimento.md). Os demais limites desta lista são de 16/07/2026 e não foram reconferidos.
+- ~~Sem testes automatizados ainda.~~ **Superado:** 910 testes aprovados e 12 ignorados em `tests/` (20 arquivos, 11.052 linhas), `uv run --with pytest pytest tests/ -q`, medidos em 14/09/2026 (após C27); em 05/10/2026 a coleta passou a **923 testes em 21 arquivos** (~11.120 linhas) com o `tests/test_round_metrics_hook.py`, que cobre o hook de métricas de rodada do harness de projeto (`.claude/hooks/fpch_round_metrics.py`, fora de `src/fpch/`, com o código de `src/` inalterado). *Skip* não conta como aprovação; o detalhamento reproduzível fica em [`docs/analises/fpch-evidencias-desenvolvimento.md`](../docs/analises/fpch-evidencias-desenvolvimento.md). Os demais limites desta lista são de 16/07/2026 e não foram reconferidos.
 - O loader de checkpoint e o verificador de artefato (`mcp verify`) recusam *links/reparse points* e comparam snapshots, mas não oferecem segurança formal contra escritor local concorrente nem *traversal* por *handles*; *hardlinks* são aceitos e o Windows não tem `O_NOFOLLOW`. A varredura de Unicode oculto (`mcp scan`) não varre membros de arquivo compactado e a detecção de escapes em modo texto ignora contexto de citação. Metadados não têm vínculo criptográfico com o artefato que descrevem, e a evidência de `setup apply` registra `unicode_version`/`ruleset`, o que pode fazer uma reaplicação futura falhar como "divergente" após upgrade do Python.
