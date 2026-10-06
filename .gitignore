@@ -14,24 +14,15 @@ build/
 # Clones de alvos de canibalização. NUNCA versionar: é código de terceiro, com
 # licença de terceiro, e o repo do FPCH não pode carregar isso.
 clones/
-docker/out/
-
-# Build do TCC
-# Decisão do autor (01/09/2026): os entregáveis gerados SÃO versionados — o .docx
-# é o formato que a USP/Esalq recebe, e o .pptx é o artefato da defesa. Só os
-# arquivos de trava do Word ficam de fora.
-~$*
 
 # Editor / SO
 .vscode/
 .idea/
 Thumbs.db
 desktop.ini
+~$*
 
-# Saída de ferramenta de análise — regenerável, não é história do projeto.
-graphify-out/
-.workstrator_tasks.json
-.claude/metrics/*
-!.claude/metrics/prices.json
+# Configuração local de agentes e saídas de ferramentas de análise.
 .claude/settings.local.json
+graphify-out/
 .tmp/
