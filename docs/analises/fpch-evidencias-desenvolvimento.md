@@ -517,3 +517,33 @@ Dois achados valem além do catálogo. Primeiro, **a lista de ajuda de um CLI n�
 **Lacunas declaradas, não verificadas.** Aplicação efetiva do sandbox do `codex` no Windows; `read-only` do `codex` contém escrita, não leitura; plugins/MCP e *hooks* da config do usuário rodam dentro da chamada `codex` (os logs mostraram os *hooks* do autor disparando) e `--ignore-user-config` não foi testado; `copilot` com `--model` explícito segue sem funcionar nesta conta.
 
 C27 concluída. C4 e C7 continuam parciais; C15, C23 e C25 continuam abertos; C26 segue aberta e agora mais defasada, porque `backends.py` cresceu de novo.
+
+## 41. Conferência de 28/09/2026: reprodução da C8 e política fantasma no código
+
+Em 28/09/2026, com o orientador tendo devolvido a `TCC_v6` com feedback (registro em [`../tcc/FEEDBACK-ORIENTADOR-TCC-V6-2026-09-28.md`](../tcc/FEEDBACK-ORIENTADOR-TCC-V6-2026-09-28.md)), o *working tree* (HEAD `0ce104b`, último commit de código `58c288a`) foi conferido contra o texto antes de reescrever os Resultados como `TCC_v7.md`. A conferência completa está em [`ficha-engenharia-fpch-2026-09-28.md`](ficha-engenharia-fpch-2026-09-28.md); este apêndice registra a reprodução da C8 e a dívida técnica nova achada, de acordo com o mesmo padrão de evidência dos apêndices anteriores. Nenhum código foi alterado nesta conferência.
+
+### 41.1 Reprodução da C8
+
+A `TCC_v6` afirma três vezes que a autocorreção causal não foi demonstrada e que a governança "campo ↔ componente" não existe (`TCC_v6.md:18`, `:329`, `:340`, `:362`, `:374`). Isso está superado desde 08/09/2026 (condição (d) em `improve.py:527-558`; demonstração em `STATUS.md:31`, `:207`, commit `3a135e3`). A sequência foi reexecutada de forma isolada no *scratchpad* desta sessão — não é o registro original de 08/09, é uma reprodução de conferência — com `[verificacao] timeout_s = 1` e um hook `lento` de 1,5 s (`quando="sempre"`, `criterio="exit_zero"`):
+
+| Passo | Comando | Resultado observado | Evento na trilha |
+|---|---|---|---|
+| 1 | `fpch --policy pol.toml check --cwd ws` | `[FALHA] lento … 1.0226s`, exit 1 | `verify` fail, `source=hook`, `fault_side=infraestrutura`, `ambiente/bloqueio_de_ambiente`, `timed_out=true`, `timeout_s=1.0`, `timeout_origin=policy`, `governing_field=verificacao.timeout_s`, esquema 4 |
+| 2 | `fpch --policy pol.toml improve` | proposta `prop-3281929bdeb7` (regra `ampliar_timeout`), `[verificacao].timeout_s: 1 → 2`, "NADA foi alterado", exit 0 | nenhum (só recusas são gravadas) |
+| 3 | `fpch --policy pol.toml improve --apply prop-3281929bdeb7` | `verificacao.timeout_s: 1 → 2`, exit 0; arquivo atualizado | `verify` pass, `component=improve.apply`, `source=politica`, `source_ref=ampliar_timeout@…pol.toml`, mesma trajetória do passo 1 |
+| 4 | `fpch --policy pol.toml check --cwd ws` | `[ok] lento … 1.5596s`, exit 0 | `verify` pass, `timeout_s=2.0`, `timeout_origin=policy`, trajetória nova |
+| 5 | `fpch --policy pol.toml audit --verify` | "trilha íntegra — 3 linha(s)", exit 0 | — |
+
+**Controle** (feito em outra área do *scratchpad*, com `[verificacao] timeout_s = 120`): `check --timeout 1` → FALHA (`timeout_origin=explicit`); `improve` → **`RECUSA campo_nao_governa_o_componente`**, sem gerar proposta, exit 1; `check` sem `--timeout` → ok. Esse é o mesmo controle que, em 03/09/2026, teria desmascarado a proteção fantasma original — a reprodução confirma que a condição (d) continua recusando corretamente quando o campo não governa o componente.
+
+### 41.2 Achados de política fantasma no código, confirmados pelo orquestrador
+
+**(a) Quatro campos da política TOML são validados e exibidos, mas nenhum mecanismo os lê.** `[escalada].ordenar_por` (o roteamento usa `(cost, -power)` fixo em `models.py:289`), `[backends].arg_limit` (usa a constante `_ARG_LIMIT` em `backends.py:48` e `:213`), `[falha].min_chars` e `[falha].assinaturas` (usam `_FAILURE_SIGNATURES` e o limiar `40` fixos em `backends.py:344-370`; `backends.py` nem importa `policy`, `:31-44`). É a mesma classe da proteção fantasma de 03/09/2026 — a política declara um campo que nenhum mecanismo consulta. Por isso `REGRA_ASSINATURA` do laço de aprimoramento tem `governanca=()` (`improve.py:166-178`) e está estruturalmente impedida de produzir proposta: mesmo com evidência de assinatura de falha, a condição (d) de governança causal nunca encontra um par `(bloco, campo)` que governe o componente, e o laço tem hoje **uma única regra produtiva** (`REGRA_TIMEOUT`).
+
+**(b) A suíte de testes escreve na trilha de auditoria real do autor.** `tests/test_setup_cli.py:650-683` executa `setup apply` sem `--trilha` e sem redirecionar `FPCH_AUDIT_LOG`, de modo que cada execução acrescenta um evento `install` a `~/.fpch/audit.jsonl`. Na data desta conferência, a trilha real tinha 98 linhas, das quais **30 vêm de repositórios temporários do pytest** (execuções de 13/09, 14/09 e 28/09/2026) — a própria reexecução da §41.1 acrescentou mais uma. A cadeia por hash segue íntegra (`fpch audit --verify` → "98 linha(s)"), mas a trilha não serve como dado empírico sem ser filtrada primeiro. Não existe `tests/conftest.py` no repositório.
+
+**(c) `fpch.policy.toml` da raiz está defasado e tem precedência sobre o catálogo do C27.** O arquivo ocupa o nível 3 da cascata de política (`policy.py:16-25`) e ainda lista 9 modelos com Gemini 3.5 Flash — que o `agy` não aceita mais desde a sondagem de C27 — sem nenhuma entrada `codex`; hoje, `fpch plan mechanical` executado na raiz do repositório escolhe "Gemini 3.5 Flash (Medium)". O comentário do próprio arquivo (`fpch.policy.toml:15-16`) diz que ele "reproduz o default embutido", o que é falso desde C27 — o commit `58c288a` atualizou o catálogo embutido em `models.py` sem tocar o TOML da raiz.
+
+**(d) Lacuna de teste na recusa (d) da C8.** Nenhum teste de `improve.py` alimenta um evento com `timeout_origin="explicit"`, `timed_out=False` ou `timeout_s` diferente do vigente para afirmar `RECUSA campo_nao_governa_o_componente`. O ramo existe em `improve.py:527-558` (a condição (d) de governança causal) e, até esta sessão, só havia sido exercitado pela reexecução manual do episódio de 03/09/2026 documentada em [`protecao-fantasma-no-laco-2026-09-03.md`](../decisoes/protecao-fantasma-no-laco-2026-09-03.md) — a reprodução da §41.1 é a segunda vez que esse ramo é observado, e continua sem cobertura automatizada.
+
+Os quatro achados foram registrados como **C30–C33** no `TODO.md` e entraram na `TCC_v7.md` — na Tabela 8 ("afirmações × evidência × situação") e na subseção de achados dos ciclos de desenvolvimento, como limites honestos do artefato em vez de alegações superadas. C4 e C7 continuam parciais; C15, C23 e C25 continuam abertos.
