@@ -31,3 +31,6 @@ desktop.ini
 # Saída de ferramenta de análise — regenerável, não é história do projeto.
 graphify-out/
 .workstrator_tasks.json
+.claude/metrics/
+.claude/settings.local.json
+.tmp/
